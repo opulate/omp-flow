@@ -56,12 +56,44 @@ BLOCKED                → previous state               (operator resets)
 
 ## Tools
 
-- `workflow_status` — read current state (includes findings, approval details, first-run guidance)
-- `workflow_transition(target?, role, action?)` — attempt state transition (guard evaluated)
+- `workflow_status` — read current state (includes findings, approval details, state_history, first-run guidance)
+- `workflow_transition(target?, role, action?)` — attempt state transition (guard evaluated via XState machine)
   - `action: "approve"` — operator approval from AWAITING_OPERATOR_APPROVAL or AWAITING_MERGE
-  - `action: "reset"` — operator reset from BLOCKED to previous_state
+  - `action: "reset"` — operator reset from BLOCKED or DONE
+  - `action: "council_signoff"` — Planner records Council sign-off from PLANNING
 - `artifact_seal(key, path, role)` — compute SHA-256 and record in state
 - `artifact_verify(key, path)` — recompute hash and compare against stored record
+
+## State History (Phase 3)
+
+Every transition is recorded in `state_history: StateTransition[]` (schema v3+):
+
+```json
+{
+  "state_history": [
+    {
+      "from": "PLANNING",
+      "to": "AWAITING_OPERATOR_APPROVAL",
+      "at": "2026-06-08T03:24:07.032Z",
+      "by": "Planner",
+      "reason": "Guard failed: hash mismatch"
+    }
+  ]
+}
+```
+
+- `reason` is populated for BLOCKED transitions
+- Last 50 entries kept; older entries pruned
+- v2→v3 migration initializes `state_history` from `previous_state`
+- `workflow_status` displays the last 3 entries; full history in `details.state_history`
+
+## Artifact Preservation (Phase 3)
+
+`writeState()` validates that artifacts in the context being written are not fewer than what's on disk. Writing a partial context that drops artifacts throws an error. The `transitionState()` helper encapsulates `loadState()` → modify → `writeState()` as the canonical pattern.
+
+## Cycle Lifecycle (Phase 3)
+
+DONE is no longer a terminal state. The operator can `/workflow reset` from DONE to start a new planning cycle. The reset clears artifacts, approvals, and archives open findings to `findings_history`.
 
 ## Approval Records (Phase 2)
 

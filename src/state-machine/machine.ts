@@ -1,11 +1,9 @@
 /**
  * XState v5 statechart for the omp-flow workflow.
  *
- * All states and valid transitions as per the specification.
- * Guard functions are injected so the machine definition stays pure
- * and guards can be unit-tested independently.
+ * Phase 3: state_history tracking on every transition. DONE is resettable.
+ * Guards are injected so the machine definition stays pure.
  */
-
 import { setup, assign } from "xstate";
 import type { WorkflowContext, TransitionTarget, Role, ApprovalRecord, WorkflowState } from "./types.js";
 import {
@@ -27,11 +25,90 @@ import {
 export type WorkflowEvent =
   | { type: "TRANSITION"; target: TransitionTarget; role: Role }
   | { type: "BLOCK"; reason: string }
-  | { type: "RESET" }
   | { type: "SET_BRANCH"; branch: string }
   | { type: "SET_PR"; pr: string }
+  | { type: "RESET"; role?: Role }
   | { type: "SET_OPERATOR_APPROVAL"; value: ApprovalRecord }
   | { type: "SET_COUNCIL_SIGN_OFF"; value: ApprovalRecord };
+
+// ── Transition Action Helpers ───────────────────────────────────────
+/** Build the assign payload for a TRANSITION event. */
+function trans(target: WorkflowState) {
+  return {
+    state: target,
+    previous_state: ({ context }: { context: WorkflowContext }) => context.state,
+    state_history: ({ context, event }: { context: WorkflowContext; event: { role?: Role } }) => {
+      const history = [...(context.state_history ?? []), {
+        from: context.state,
+        to: target,
+        at: new Date().toISOString(),
+        by: event.role ?? ("unknown" as Role),
+      }];
+      if (history.length > 50) history.splice(0, history.length - 50);
+      return history;
+    },
+    transitioned_at: () => new Date().toISOString(),
+    transitioned_by: ({ event }: { event: { role?: Role } }) => event.role ?? ("unknown" as Role),
+  };
+}
+
+/** Build assign payload for RESET events (clears block_reason). */
+function resetTrans(target: WorkflowState) {
+  return { ...trans(target), block_reason: null };
+}
+
+/** Build the assign payload for a BLOCK event. */
+function blk() {
+  return {
+    state: "BLOCKED" as WorkflowState,
+    previous_state: ({ context }: { context: WorkflowContext }) => context.state,
+    state_history: ({ context, event }: { context: WorkflowContext; event: { reason: string } }) => {
+      const history = [...(context.state_history ?? []), {
+        from: context.state,
+        to: "BLOCKED" as WorkflowState,
+        at: new Date().toISOString(),
+        by: "unknown" as Role,
+        reason: event.reason,
+      }];
+      if (history.length > 50) history.splice(0, history.length - 50);
+      return history;
+    },
+    block_reason: ({ event }: { event: { reason: string } }) => event.reason,
+  };
+}
+
+/** Build the assign payload for DONE → PLANNING RESET. */
+function doneReset() {
+  return {
+    state: "PLANNING" as WorkflowState,
+    previous_state: "DONE" as WorkflowState,
+    state_history: ({ context }: { context: WorkflowContext }) => {
+      const history = [...(context.state_history ?? []), {
+        from: "DONE" as WorkflowState,
+        to: "PLANNING" as WorkflowState,
+        at: new Date().toISOString(),
+        by: "Operator" as Role,
+      }];
+      if (history.length > 50) history.splice(0, history.length - 50);
+      return history;
+    },
+    artifacts: {} as Record<string, never>,
+    council_sign_off: null,
+    operator_approval: null,
+    findings_open: [] as never[],
+    findings_history: ({ context }: { context: WorkflowContext }) => [
+      ...(context.findings_history ?? []),
+      ...(context.findings_open ?? []).map((f) => ({
+        ...f,
+        status: "closed" as const,
+        closed_at: new Date().toISOString(),
+      })),
+    ],
+    block_reason: null,
+    transitioned_at: () => new Date().toISOString(),
+    transitioned_by: "Operator" as Role,
+  };
+}
 
 // ── Machine Factory ─────────────────────────────────────────────────
 
@@ -71,248 +148,75 @@ export function createWorkflowMachine(initialContext: WorkflowContext) {
     context: initialContext,
     initial: initialContext.state,
 
-    // Global events — metadata updates work from any state
     on: {
-      SET_BRANCH: {
-        actions: assign({ feature_branch: ({ event }) => event.branch }),
-      },
-      SET_PR: {
-        actions: assign({ current_pr: ({ event }) => event.pr }),
-      },
-      SET_OPERATOR_APPROVAL: {
-        actions: assign({ operator_approval: ({ event }) => event.value }),
-      },
-      SET_COUNCIL_SIGN_OFF: {
-        actions: assign({ council_sign_off: ({ event }) => event.value }),
-      },
+      SET_BRANCH: { actions: assign({ feature_branch: ({ event }) => event.branch }) },
+      SET_PR: { actions: assign({ current_pr: ({ event }) => event.pr }) },
+      SET_OPERATOR_APPROVAL: { actions: assign({ operator_approval: ({ event }) => event.value }) },
+      SET_COUNCIL_SIGN_OFF: { actions: assign({ council_sign_off: ({ event }) => event.value }) },
     },
 
     states: {
       PLANNING: {
         on: {
-          TRANSITION: {
-            guard: { type: "canTransitionToAwaitingApproval" },
-            target: "AWAITING_OPERATOR_APPROVAL",
-            actions: assign({
-              state: "AWAITING_OPERATOR_APPROVAL",
-              previous_state: "PLANNING",
-              transitioned_at: () => new Date().toISOString(),
-              transitioned_by: ({ event }) => event.role,
-            }),
-          },
-          BLOCK: {
-            guard: { type: "canTransitionToBlocked" },
-            target: "BLOCKED",
-            actions: assign({
-              previous_state: "PLANNING",
-              state: "BLOCKED",
-              block_reason: ({ event }) => event.reason,
-            }),
-          },
+          TRANSITION: { guard: { type: "canTransitionToAwaitingApproval" }, target: "AWAITING_OPERATOR_APPROVAL", actions: assign(trans("AWAITING_OPERATOR_APPROVAL")) },
+          BLOCK: { guard: { type: "canTransitionToBlocked" }, target: "BLOCKED", actions: assign(blk()) },
         },
       },
-
       "AWAITING_OPERATOR_APPROVAL": {
         on: {
-          TRANSITION: {
-            guard: { type: "canTransitionToImplementing" },
-            target: "IMPLEMENTING",
-            actions: assign({
-              state: "IMPLEMENTING",
-              previous_state: "AWAITING_OPERATOR_APPROVAL",
-              transitioned_at: () => new Date().toISOString(),
-              transitioned_by: ({ event }) => event.role,
-            }),
-          },
-          BLOCK: {
-            guard: { type: "canTransitionToBlocked" },
-            target: "BLOCKED",
-            actions: assign({
-              previous_state: "AWAITING_OPERATOR_APPROVAL",
-              state: "BLOCKED",
-              block_reason: ({ event }) => event.reason,
-            }),
-          },
+          TRANSITION: { guard: { type: "canTransitionToImplementing" }, target: "IMPLEMENTING", actions: assign(trans("IMPLEMENTING")) },
+          BLOCK: { guard: { type: "canTransitionToBlocked" }, target: "BLOCKED", actions: assign(blk()) },
         },
       },
-
       IMPLEMENTING: {
         on: {
-          TRANSITION: {
-            guard: { type: "canTransitionToAwaitingCouncil" },
-            target: "AWAITING_COUNCIL_REVIEW",
-            actions: assign({
-              state: "AWAITING_COUNCIL_REVIEW",
-              previous_state: "IMPLEMENTING",
-              transitioned_at: () => new Date().toISOString(),
-              transitioned_by: ({ event }) => event.role,
-            }),
-          },
-          BLOCK: {
-            guard: { type: "canTransitionToBlocked" },
-            target: "BLOCKED",
-            actions: assign({
-              previous_state: "IMPLEMENTING",
-              state: "BLOCKED",
-              block_reason: ({ event }) => event.reason,
-            }),
-          },
+          TRANSITION: { guard: { type: "canTransitionToAwaitingCouncil" }, target: "AWAITING_COUNCIL_REVIEW", actions: assign(trans("AWAITING_COUNCIL_REVIEW")) },
+          BLOCK: { guard: { type: "canTransitionToBlocked" }, target: "BLOCKED", actions: assign(blk()) },
         },
       },
-
       "AWAITING_COUNCIL_REVIEW": {
         on: {
           TRANSITION: [
-            {
-              guard: { type: "canTransitionToValidating" },
-              target: "VALIDATING",
-              actions: assign({
-                state: "VALIDATING",
-                previous_state: "AWAITING_COUNCIL_REVIEW",
-                transitioned_at: () => new Date().toISOString(),
-                transitioned_by: ({ event }) => event.role,
-              }),
-            },
-            {
-              guard: { type: "canTransitionFromCouncilToImplementing" },
-              target: "IMPLEMENTING",
-              actions: assign({
-                state: "IMPLEMENTING",
-                previous_state: "AWAITING_COUNCIL_REVIEW",
-                transitioned_at: () => new Date().toISOString(),
-                transitioned_by: ({ event }) => event.role,
-              }),
-            },
+            { guard: { type: "canTransitionToValidating" }, target: "VALIDATING", actions: assign(trans("VALIDATING")) },
+            { guard: { type: "canTransitionFromCouncilToImplementing" }, target: "IMPLEMENTING", actions: assign(trans("IMPLEMENTING")) },
           ],
-          BLOCK: {
-            guard: { type: "canTransitionToBlocked" },
-            target: "BLOCKED",
-            actions: assign({
-              previous_state: "AWAITING_COUNCIL_REVIEW",
-              state: "BLOCKED",
-              block_reason: ({ event }) => event.reason,
-            }),
-          },
+          BLOCK: { guard: { type: "canTransitionToBlocked" }, target: "BLOCKED", actions: assign(blk()) },
         },
       },
-
       VALIDATING: {
         on: {
           TRANSITION: [
-            {
-              guard: { type: "canTransitionToRetro" },
-              target: "RETRO",
-              actions: assign({
-                state: "RETRO",
-                previous_state: "VALIDATING",
-                transitioned_at: () => new Date().toISOString(),
-                transitioned_by: ({ event }) => event.role,
-              }),
-            },
-            {
-              guard: { type: "canTransitionFromValidatingToImplementing" },
-              target: "IMPLEMENTING",
-              actions: assign({
-                state: "IMPLEMENTING",
-                previous_state: "VALIDATING",
-                transitioned_at: () => new Date().toISOString(),
-                transitioned_by: ({ event }) => event.role,
-              }),
-            },
+            { guard: { type: "canTransitionToRetro" }, target: "RETRO", actions: assign(trans("RETRO")) },
+            { guard: { type: "canTransitionFromValidatingToImplementing" }, target: "IMPLEMENTING", actions: assign(trans("IMPLEMENTING")) },
           ],
-          BLOCK: {
-            guard: { type: "canTransitionToBlocked" },
-            target: "BLOCKED",
-            actions: assign({
-              previous_state: "VALIDATING",
-              state: "BLOCKED",
-              block_reason: ({ event }) => event.reason,
-            }),
-          },
+          BLOCK: { guard: { type: "canTransitionToBlocked" }, target: "BLOCKED", actions: assign(blk()) },
         },
       },
-
       RETRO: {
         on: {
-          TRANSITION: {
-            guard: { type: "canTransitionToAwaitingMerge" },
-            target: "AWAITING_MERGE",
-            actions: assign({
-              state: "AWAITING_MERGE",
-              previous_state: "RETRO",
-              transitioned_at: () => new Date().toISOString(),
-              transitioned_by: ({ event }) => event.role,
-            }),
-          },
-          BLOCK: {
-            guard: { type: "canTransitionToBlocked" },
-            target: "BLOCKED",
-            actions: assign({
-              previous_state: "RETRO",
-              state: "BLOCKED",
-              block_reason: ({ event }) => event.reason,
-            }),
-          },
+          TRANSITION: { guard: { type: "canTransitionToAwaitingMerge" }, target: "AWAITING_MERGE", actions: assign(trans("AWAITING_MERGE")) },
+          BLOCK: { guard: { type: "canTransitionToBlocked" }, target: "BLOCKED", actions: assign(blk()) },
         },
       },
-
       "AWAITING_MERGE": {
         on: {
-          TRANSITION: {
-            guard: { type: "canTransitionToDone" },
-            target: "DONE",
-            actions: assign({
-              state: "DONE",
-              previous_state: "AWAITING_MERGE",
-              transitioned_at: () => new Date().toISOString(),
-              transitioned_by: ({ event }) => event.role,
-            }),
-          },
-          BLOCK: {
-            guard: { type: "canTransitionToBlocked" },
-            target: "BLOCKED",
-            actions: assign({
-              previous_state: "AWAITING_MERGE",
-              state: "BLOCKED",
-              block_reason: ({ event }) => event.reason,
-            }),
-          },
+          TRANSITION: { guard: { type: "canTransitionToDone" }, target: "DONE", actions: assign(trans("DONE")) },
+          BLOCK: { guard: { type: "canTransitionToBlocked" }, target: "BLOCKED", actions: assign(blk()) },
         },
       },
-
       DONE: {
-        type: "final",
+        on: {
+          RESET: { target: "PLANNING", actions: assign(doneReset()) },
+        },
       },
-
       ERROR: {
         on: {
-          RESET: {
-            target: "PLANNING",
-            actions: assign({
-              state: "PLANNING",
-              previous_state: "ERROR",
-              transitioned_at: () => new Date().toISOString(),
-            }),
-          },
+          RESET: { target: "PLANNING", actions: assign(resetTrans("PLANNING")) },
         },
       },
-
       BLOCKED: {
         on: {
-          // RESET from BLOCKED: the workflow_transition tool restores
-          // previous_state before persisting. The machine targets PLANNING
-          // as a safe default; the tool overrides this with the actual
-          // previous_state from context. The guard validates it is present.
-          RESET: {
-            guard: { type: "canResetToPrevious" },
-            target: "PLANNING",
-            actions: assign({
-              state: "PLANNING",
-              previous_state: "BLOCKED",
-              block_reason: null,
-              transitioned_at: () => new Date().toISOString(),
-            }),
-          },
+          RESET: { guard: { type: "canResetToPrevious" }, target: "PLANNING", actions: assign(resetTrans("PLANNING")) },
         },
       },
     },

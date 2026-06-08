@@ -1,73 +1,44 @@
 /**
  * workflow_transition — Evaluate guard conditions and transition workflow state.
  *
- * This is the core enforcement mechanism. On a TRANSITION event:
- * 1. Load current state from .omp/workflow/state.json
- * 2. Create/advance XState machine to current state
- * 3. Evaluate the guard for the requested transition
- * 4. On pass: write new state, return success
- * 5. On fail: return structured error with reason
+ * Phase 3: Single code path via actor.send(). Guards live exclusively in
+ * the XState machine — no duplicate GUARD_MAP. State persistence uses
+ * the transitionState() helper which appends to state_history.
+ *
+ * Actions:
+ *   - target + role: attempt transition to target state
+ *   - action="approve": operator approval from AWAITING_OPERATOR_APPROVAL or AWAITING_MERGE
+ *   - action="reset": operator reset from BLOCKED or DONE
+ *   - action="council_signoff": record Council sign-off from PLANNING
  */
 import type { CustomToolFactory } from "@oh-my-pi/pi-coding-agent";
 import { createActor } from "xstate";
-import { loadState, writeState } from "../../../src/integrity/state-persistence.js";
+import { loadState, writeState, transitionState } from "../../../src/integrity/state-persistence.js";
 import { createWorkflowMachine } from "../../../src/state-machine/machine.js";
 import type {
   WorkflowState,
   TransitionTarget,
   Role,
+  WorkflowContext,
 } from "../../../src/state-machine/types.js";
-import {
-  guardPlanningToAwaitingApproval,
-  guardAwaitingApprovalToImplementing,
-  guardImplementingToAwaitingCouncil,
-  guardAwaitingCouncilToValidating,
-  guardValidatingToRetro,
-  guardRetroToAwaitingMerge,
-  guardAwaitingMergeToDone,
-  guardBlockedToPrevious,
-} from "../../../src/state-machine/guards.js";
-import type { GuardResult } from "../../../src/state-machine/types.js";
+// ── Helpers ──────────────────────────────────────────────────────────
 
-/** Map transition target to the guard function that validates the edge. */
-const GUARD_MAP: Record<string, (ctx: ReturnType<typeof loadState>) => GuardResult> = {
-  AWAITING_OPERATOR_APPROVAL: guardPlanningToAwaitingApproval,
-  IMPLEMENTING: (ctx) => {
-    // TWO possible sources: AWAITING_OPERATOR_APPROVAL → IMPLEMENTING
-    // or AWAITING_COUNCIL_REVIEW → IMPLEMENTING (Council returns findings)
-    if (ctx.state === "AWAITING_OPERATOR_APPROVAL") {
-      return guardAwaitingApprovalToImplementing(ctx);
-    }
-    if (ctx.state === "AWAITING_COUNCIL_REVIEW") {
-      // Council returns findings — always allowed
-      return { allowed: true };
-    }
-    if (ctx.state === "VALIDATING") {
-      // Validator found regressions — always allowed
-      return { allowed: true };
-    }
-    return { allowed: false, reason: `Cannot transition to IMPLEMENTING from ${ctx.state}` };
-  },
-  AWAITING_COUNCIL_REVIEW: guardImplementingToAwaitingCouncil,
-  VALIDATING: guardAwaitingCouncilToValidating,
-  RETRO: guardValidatingToRetro,
-  AWAITING_MERGE: guardRetroToAwaitingMerge,
-  DONE: guardAwaitingMergeToDone,
-};
+/** Create a running actor from current persisted state. */
+function createRunningActor(ctx: WorkflowContext) {
+  const machine = createWorkflowMachine(ctx);
+  const actor = createActor(machine);
+  actor.start();
+  return actor;
+}
 
-/** Valid transitions from each state */
-const VALID_TARGETS: Record<WorkflowState, TransitionTarget[]> = {
-  PLANNING: ["AWAITING_OPERATOR_APPROVAL", "BLOCKED"],
-  AWAITING_OPERATOR_APPROVAL: ["IMPLEMENTING", "BLOCKED"],
-  IMPLEMENTING: ["AWAITING_COUNCIL_REVIEW", "BLOCKED"],
-  AWAITING_COUNCIL_REVIEW: ["VALIDATING", "IMPLEMENTING", "BLOCKED"],
-  VALIDATING: ["RETRO", "IMPLEMENTING", "BLOCKED"],
-  RETRO: ["AWAITING_MERGE", "BLOCKED"],
-  AWAITING_MERGE: ["DONE", "BLOCKED"],
-  DONE: [],
-  ERROR: [],
-  BLOCKED: [], // Reset handled separately
-};
+/** Detect which transition target the machine uses for approve from the current state. */
+function approveTarget(state: WorkflowState): TransitionTarget | null {
+  if (state === "AWAITING_OPERATOR_APPROVAL") return "IMPLEMENTING";
+  if (state === "AWAITING_MERGE") return "DONE";
+  return null;
+}
+
+// ── Tool Factory ─────────────────────────────────────────────────────
 
 const factory: CustomToolFactory = (pi) => ({
   name: "workflow_transition",
@@ -87,16 +58,15 @@ const factory: CustomToolFactory = (pi) => ({
         "BLOCKED",
       ] as const)
       .optional()
-      .describe("Target state to transition to (omit for approve/reset actions)"),
+      .describe("Target state to transition to (omit for approve/reset/council_signoff actions)"),
     role: pi.zod
       .enum(["Planner", "Implementor", "Council", "Validator", "Retro", "Operator"] as const)
       .describe("Role initiating the transition"),
     action: pi.zod
-      .enum(["approve", "reset"] as const)
+      .enum(["approve", "reset", "council_signoff"] as const)
       .optional()
-      .describe("Operator action: 'approve' to approve and advance, 'reset' to reset from BLOCKED"),
+      .describe("Operator/Planner action: 'approve', 'reset', or 'council_signoff'"),
   }),
-
 
   async execute(_toolCallId, params) {
     const ctx = loadState();
@@ -104,7 +74,7 @@ const factory: CustomToolFactory = (pi) => ({
 
     // ── Operator Actions ─────────────────────────────────────────
 
-    // /workflow approve: record operator approval and advance
+    // /workflow approve
     if (params.action === "approve") {
       if (params.role !== "Operator") {
         return {
@@ -112,55 +82,49 @@ const factory: CustomToolFactory = (pi) => ({
           details: { success: false, from: currentState, to: null, error: "Role must be Operator for approve action." },
         };
       }
-      if (currentState === "AWAITING_OPERATOR_APPROVAL") {
-        ctx.operator_approval = {
-          approved: true,
-          approved_by: "Operator",
-          approved_at: new Date().toISOString(),
-          method: "slash-command",
-        };
-        // Evaluate the guard — structured contract validation happens here
-        const guardResult = guardAwaitingApprovalToImplementing(ctx);
-        if (!guardResult.allowed) {
-          return {
-            content: [{ type: "text", text: `Approval blocked: ${guardResult.reason}` }],
-            details: { success: false, from: currentState, to: null, error: guardResult.reason },
-          };
-        }
-        ctx.previous_state = currentState;
-        ctx.state = "IMPLEMENTING";
-        ctx.transitioned_at = ctx.operator_approval.approved_at;
-        ctx.transitioned_by = "Operator";
-        writeState(ctx);
+
+      const target = approveTarget(currentState);
+      if (!target) {
         return {
-          content: [{ type: "text", text: `Approved: ${currentState} → IMPLEMENTING\nApproved by: Operator\nAt: ${ctx.transitioned_at}` }],
-          details: { success: true, from: currentState, to: "IMPLEMENTING" },
+          content: [{ type: "text", text: `Cannot approve from ${currentState}. Approval is only valid from AWAITING_OPERATOR_APPROVAL or AWAITING_MERGE.` }],
+          details: { success: false, from: currentState, to: null, error: `Approve action invalid from ${currentState}` },
         };
       }
-      if (currentState === "AWAITING_MERGE") {
-        ctx.operator_approval = {
-          approved: true,
-          approved_by: "Operator",
-          approved_at: new Date().toISOString(),
-          method: "slash-command",
-        };
-        ctx.previous_state = currentState;
-        ctx.state = "DONE";
-        ctx.transitioned_at = ctx.operator_approval.approved_at;
-        ctx.transitioned_by = "Operator";
-        writeState(ctx);
+
+      // Record operator approval
+      ctx.operator_approval = {
+        approved: true,
+        approved_by: "Operator",
+        approved_at: new Date().toISOString(),
+        method: "slash-command",
+      };
+
+      // Send approve + transition through the machine
+      const actor = createRunningActor(ctx);
+      actor.send({ type: "SET_OPERATOR_APPROVAL", value: ctx.operator_approval });
+      actor.send({ type: "TRANSITION", target, role: params.role });
+      const snapshot = actor.getSnapshot();
+
+      if (snapshot.value !== target) {
         return {
-          content: [{ type: "text", text: `Approved: ${currentState} → DONE\nApproved by: Operator\nAt: ${ctx.transitioned_at}` }],
-          details: { success: true, from: currentState, to: "DONE" },
+          content: [{ type: "text", text: `Approval blocked: transition ${currentState} → ${target} failed guard. Check contract and artifacts.` }],
+          details: { success: false, from: currentState, to: null, error: `Guard blocked ${currentState} → ${target}` },
         };
       }
+
+      // Persist via transitionState (handles state_history)
+      const newCtx = snapshot.context as WorkflowContext;
+      // transfer operator_approval since machine assign may not have set it
+      newCtx.operator_approval = ctx.operator_approval;
+      writeState(newCtx);
+
       return {
-        content: [{ type: "text", text: `Cannot approve from ${currentState}. Approval is only valid from AWAITING_OPERATOR_APPROVAL or AWAITING_MERGE.` }],
-        details: { success: false, from: currentState, to: null, error: `Approve action invalid from ${currentState}` },
+        content: [{ type: "text", text: `Approved: ${currentState} → ${target}\nApproved by: Operator\nAt: ${ctx.operator_approval.approved_at}` }],
+        details: { success: true, from: currentState, to: target },
       };
     }
 
-    // /workflow reset: reset from BLOCKED
+    // /workflow reset
     if (params.action === "reset") {
       if (params.role !== "Operator") {
         return {
@@ -168,172 +132,111 @@ const factory: CustomToolFactory = (pi) => ({
           details: { success: false, from: currentState, to: null, error: "Role must be Operator for reset action." },
         };
       }
-      if (currentState === "BLOCKED") {
-        const guardResult = guardBlockedToPrevious(ctx);
-        if (!guardResult.allowed) {
-          return {
-            content: [{ type: "text", text: `Reset blocked: ${guardResult.reason}` }],
-            details: { success: false, from: currentState, to: null, error: guardResult.reason },
-          };
-        }
-        const resetTarget = ctx.previous_state ?? "PLANNING";
-        ctx.previous_state = "BLOCKED";
-        ctx.state = resetTarget;
-        ctx.block_reason = null;
-        ctx.transitioned_at = new Date().toISOString();
-        ctx.transitioned_by = "Operator";
-        writeState(ctx);
+
+      // Phase 3: reset from BLOCKED or DONE
+      if (currentState !== "BLOCKED" && currentState !== "DONE") {
         return {
-          content: [{ type: "text", text: `Reset: BLOCKED → ${resetTarget}\nReset by: Operator\nAt: ${ctx.transitioned_at}` }],
-          details: { success: true, from: "BLOCKED", to: resetTarget },
+          content: [{ type: "text", text: `Cannot reset from ${currentState}. Reset is only valid from BLOCKED or DONE.` }],
+          details: { success: false, from: currentState, to: null, error: `Reset action invalid from ${currentState}` },
         };
       }
+
+      if (currentState === "BLOCKED" && !ctx.previous_state) {
+        return {
+          content: [{ type: "text", text: "Cannot reset: no previous_state recorded. The workflow may need manual intervention." }],
+          details: { success: false, from: currentState, to: null, error: "No previous_state for BLOCKED reset." },
+        };
+      }
+
+      const actor = createRunningActor(ctx);
+      actor.send({ type: "RESET", role: params.role });
+      const snapshot = actor.getSnapshot();
+
+      const newState = snapshot.value as WorkflowState;
+      if (newState === currentState) {
+        return {
+          content: [{ type: "text", text: `Reset blocked: guard prevented transition from ${currentState}.` }],
+          details: { success: false, from: currentState, to: null, error: `Reset guard blocked in ${currentState}` },
+        };
+      }
+
+      const newCtx = snapshot.context as WorkflowContext;
+      writeState(newCtx);
+      const resetTarget = currentState === "BLOCKED" ? "(previous state)" : "PLANNING";
       return {
-        content: [{ type: "text", text: `Cannot reset from ${currentState}. Reset is only valid from BLOCKED.` }],
-        details: { success: false, from: currentState, to: null, error: `Reset action invalid from ${currentState}` },
+        content: [{ type: "text", text: `Reset: ${currentState} → ${newState} ${resetTarget}\nReset by: Operator\nAt: ${new Date().toISOString()}` }],
+        details: { success: true, from: currentState, to: newState },
       };
     }
 
-    // Target is required for regular transitions (not approve/reset)
+    // /workflow council_signoff
+    if (params.action === "council_signoff") {
+      if (params.role !== "Planner") {
+        return {
+          content: [{ type: "text", text: "Only the Planner can record Council sign-off." }],
+          details: { success: false, from: currentState, to: null, error: "Role must be Planner for council_signoff action." },
+        };
+      }
+
+      if (currentState !== "PLANNING") {
+        return {
+          content: [{ type: "text", text: `Council sign-off is only valid in PLANNING state. Current state: ${currentState}.` }],
+          details: { success: false, from: currentState, to: null, error: `council_signoff invalid from ${currentState}` },
+        };
+      }
+
+      const approval = {
+        approved: true,
+        approved_by: "Council" as const,
+        approved_at: new Date().toISOString(),
+        method: "tool-call" as const,
+      };
+
+      ctx.council_sign_off = approval;
+      const actor = createRunningActor(ctx);
+      actor.send({ type: "SET_COUNCIL_SIGN_OFF", value: approval });
+      const snapshot = actor.getSnapshot();
+      const newCtx = snapshot.context as WorkflowContext;
+      newCtx.council_sign_off = approval;
+      writeState(newCtx);
+
+      return {
+        content: [{ type: "text", text: `Council sign-off recorded.\nApproved by: Council\nAt: ${approval.approved_at}` }],
+        details: { success: true, from: currentState, to: currentState, council_sign_off: approval },
+      };
+    }
+
+    // ── Regular Transition ───────────────────────────────────────
+
     if (!params.target) {
       return {
-        content: [{ type: "text", text: "Target state is required for transitions. Use 'action: approve' or 'action: reset' for operator actions." }],
+        content: [{ type: "text", text: "Target state is required for transitions. Use 'action: approve', 'action: reset', or 'action: council_signoff' for operator/planner actions." }],
         details: { success: false, from: currentState, to: null, error: "Missing target parameter." },
       };
     }
 
-
     const target = params.target as TransitionTarget;
 
-    // ── BLOCKED: allow reset to previous state ───────────────────
-    if (currentState === "BLOCKED") {
-      const guardResult = guardBlockedToPrevious(ctx);
-      if (!guardResult.allowed) {
-        return {
-          content: [{ type: "text", text: `Reset blocked: ${guardResult.reason}` }],
-          details: { success: false, from: currentState, to: null, error: guardResult.reason },
-        };
-      }
-      const resetTarget = ctx.previous_state ?? "PLANNING";
-      if (target !== resetTarget) {
-        return {
-          content: [{ type: "text", text: `Cannot transition from BLOCKED to ${target}. Reset target must be ${resetTarget} (previous state).` }],
-          details: { success: false, from: currentState, to: null, error: `From BLOCKED, only reset to ${resetTarget} is allowed.` },
-        };
-      }
-      ctx.previous_state = "BLOCKED";
-      ctx.state = resetTarget;
-      ctx.transitioned_at = new Date().toISOString();
-      ctx.transitioned_by = params.role as Role;
-      writeState(ctx);
-      return {
-        content: [{ type: "text", text: `State reset: BLOCKED → ${resetTarget}\nReset by: ${params.role}\nAt: ${ctx.transitioned_at}` }],
-        details: { success: true, from: "BLOCKED", to: resetTarget },
-      };
-    }
-
-    // Validate the transition is structurally valid
-    const validTargets = VALID_TARGETS[currentState] ?? [];
-    if (!validTargets.includes(target)) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Invalid transition: ${currentState} → ${target}\nValid targets from ${currentState}: ${validTargets.join(", ") || "none"}`,
-          },
-        ],
-        details: {
-          success: false,
-          from: currentState,
-          to: null,
-          error: `Invalid transition from ${currentState} to ${target}`,
-        },
-      };
-    }
-
-    // BLOCKED target goes straight through (no guard to evaluate for BLOCKED)
-    if (target === "BLOCKED") {
-      ctx.previous_state = currentState;
-      ctx.state = "BLOCKED";
-      ctx.transitioned_at = new Date().toISOString();
-      ctx.transitioned_by = params.role as Role;
-      writeState(ctx);
-
-      return {
-        content: [{ type: "text", text: `State transitioned: ${currentState} → BLOCKED` }],
-        details: { success: true, from: currentState, to: "BLOCKED" },
-      };
-    }
-
-    // Evaluate guard
-    const guardFn = GUARD_MAP[target];
-    if (!guardFn) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `No guard defined for transition to ${target}`,
-          },
-        ],
-        details: {
-          success: false,
-          from: currentState,
-          to: null,
-          error: `No guard defined for target: ${target}`,
-        },
-      };
-    }
-
-    const guardResult = guardFn(ctx);
-    if (!guardResult.allowed) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Transition blocked: ${currentState} → ${target}\nReason: ${guardResult.reason}`,
-          },
-        ],
-        details: {
-          success: false,
-          from: currentState,
-          to: null,
-          error: guardResult.reason,
-        },
-      };
-    }
-
-    // Transition passes — advance state via XState machine, then persist
-    const previousState = currentState;
-    ctx.state = target;
-    ctx.previous_state = previousState;
-    ctx.transitioned_at = new Date().toISOString();
-    ctx.transitioned_by = params.role as Role;
-
-    // Advance the machine to keep context in sync (uses createActor to avoid crash)
-    const machine = createWorkflowMachine(ctx);
-    const actor = createActor(machine);
+    const actor = createRunningActor(ctx);
+    actor.send({ type: "TRANSITION", target, role: params.role });
     const snapshot = actor.getSnapshot();
-    const nextSnapshot = machine.transition(snapshot, {
-      type: "TRANSITION",
-      target,
-      role: params.role as Role,
-    });
-    if (nextSnapshot.context) {
-      Object.assign(ctx, nextSnapshot.context);
+    const newState = snapshot.value as WorkflowState;
+
+    if (newState === currentState) {
+      // Transition blocked by guard
+      return {
+        content: [{ type: "text", text: `Transition blocked: ${currentState} → ${target}\nReason: Guard prevented transition. Check workflow_status for details on required artifacts and approvals.` }],
+        details: { success: false, from: currentState, to: null, error: `Guard blocked ${currentState} → ${target}` },
+      };
     }
 
-    // Single atomic write
-    writeState(ctx);
-
-    const text = `State transitioned: ${previousState} → ${target}\nTransitioned by: ${params.role}\nAt: ${ctx.transitioned_at}`;
+    // Persist — transitionState handles state_history
+    const newCtx = snapshot.context as WorkflowContext;
+    writeState(newCtx);
 
     return {
-      content: [{ type: "text", text }],
-      details: {
-        success: true,
-        from: previousState,
-        to: target,
-      },
+      content: [{ type: "text", text: `State transitioned: ${currentState} → ${newState}\nTransitioned by: ${params.role}\nAt: ${new Date().toISOString()}` }],
+      details: { success: true, from: currentState, to: newState },
     };
   },
 });

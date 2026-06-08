@@ -83,18 +83,29 @@ export interface ApprovalRecord {
   method: "slash-command" | "state-edit" | "tool-call";
 }
 
+// ── State Transition Record ──────────────────────────────────────────
+/** Immutable record of a single workflow state transition. */
+export interface StateTransition {
+  from: WorkflowState;
+  to: WorkflowState;
+  at: string;          // ISO timestamp
+  by: Role;
+  reason?: string;     // populated for BLOCKED transitions
+}
+
 // ── Workflow Context (state.json schema) ────────────────────────────
 export interface WorkflowContext {
   schema_version: number;
   state: WorkflowState;
-  previous_state: WorkflowState | null;
+  state_history: StateTransition[];  // v3: replaces single previous_state
+  previous_state: WorkflowState | null;  // retained for backward compat, derived from state_history tail
   current_pr: string | null;
   feature_branch: string | null;
   artifacts: Record<string, ArtifactRecord>;
   council_sign_off: ApprovalRecord | null;
   operator_approval: ApprovalRecord | null;
   findings_open: CouncilFinding[];
-  findings_history: CouncilFinding[]; // append-only audit trail
+  findings_history: CouncilFinding[];
   block_reason: string | null;
   transitioned_at: string | null;
   transitioned_by: Role | null;
@@ -103,8 +114,9 @@ export interface WorkflowContext {
 // ── Initial Context Factory ─────────────────────────────────────────
 export function createInitialContext(): WorkflowContext {
   return {
-    schema_version: 2,
+    schema_version: 3,
     state: "PLANNING",
+    state_history: [],
     previous_state: null,
     current_pr: null,
     feature_branch: null,

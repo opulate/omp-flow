@@ -6,8 +6,9 @@ Workflow state machine control for omp-flow.
 
 ### /workflow status
 
-Read the current workflow state. Calls `workflow_status` tool and displays:
+
 - Current state and previous state
+- State history (last 3 transitions with timestamps and roles)
 - Feature branch and PR
 - Block reason (if BLOCKED)
 - Sealed artifacts with timestamps
@@ -29,17 +30,24 @@ Implementation: calls `workflow_transition(action="approve", role="Operator")`. 
 
 ### /workflow reset
 
-Operator-only. Resets the workflow from error states:
+Operator-only. Resets the workflow from error/terminal states:
 - From `BLOCKED` → `previous_state` (dynamically resolved from context)
+- From `DONE` → `PLANNING` (clears artifacts, approvals, archives findings)
 - Other states: returns error
 - Clears `block_reason`
 
 Implementation: calls `workflow_transition(action="reset", role="Operator")`.
 
+### /workflow council-signoff
+
+Planner-only. Records Council sign-off with audit trail. Only valid from `PLANNING` state.
+
+Implementation: calls `workflow_transition(action="council_signoff", role="Planner")`.
+
 ### /workflow info
 
 Display the full state machine reference: all states, valid transitions, and guard conditions.
 
-## Phase 2
+## Phase 3
 
-All subcommands (`status`, `approve`, `reset`, `info`) are implemented. The `approve` and `reset` commands use structured `ApprovalRecord` with audit trail (approved_by, approved_at, method).
+All subcommands are implemented. State history tracks every transition. DONE is resettable. Artifact preservation prevents partial-context writes. The `workflow_transition` tool uses `actor.send()` as the single mutation path — guards live exclusively in the XState machine.

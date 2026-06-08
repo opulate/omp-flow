@@ -9,8 +9,8 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, copyFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { WorkflowContext } from "../state-machine/types.js";
-import { createInitialContext, WORKFLOW_STATES, type ApprovalRecord } from "../state-machine/types.js";
+import type { WorkflowContext, StateTransition } from "../state-machine/types.js";
+import { createInitialContext, WORKFLOW_STATES, type ApprovalRecord, type Role } from "../state-machine/types.js";
 
 const STATE_PATH = resolve(".omp/workflow/state.json");
 
@@ -47,7 +47,7 @@ export function loadState(): WorkflowContext {
 
   const p = parsed as Record<string, unknown>;
 
-  // Schema migration: v1 → v2 (ApprovalRecord replaces bare booleans)
+  // Schema migration: v1/v2 → v3
   const version = typeof p.schema_version === "number" ? p.schema_version : 1;
 
   let council_sign_off = (p.council_sign_off as WorkflowContext["council_sign_off"]) ?? null;
@@ -59,11 +59,26 @@ export function loadState(): WorkflowContext {
     operator_approval = migrateApproval(p.operator_approval);
   }
 
-  const migrated = version < 2;
+  const migratedV2 = version < 2;
+  const migratedV3 = version < 3;
+
+  // v2→v3: initialize state_history from previous_state if present
+  let stateHistory: StateTransition[] = [];
+  if (migratedV3 && p.previous_state && p.state) {
+    stateHistory = [{
+      from: p.previous_state as StateTransition["from"],
+      to: p.state as StateTransition["to"],
+      at: typeof p.transitioned_at === "string" ? p.transitioned_at : "unknown",
+      by: (typeof p.transitioned_by === "string" ? p.transitioned_by : "unknown") as StateTransition["by"],
+    }];
+  } else if (Array.isArray(p.state_history)) {
+    stateHistory = p.state_history as StateTransition[];
+  }
 
   const result: WorkflowContext = {
-    schema_version: migrated ? 2 : version,
+    schema_version: migratedV2 || migratedV3 ? 3 : version,
     state: (p.state as WorkflowContext["state"]) ?? "PLANNING",
+    state_history: stateHistory,
     previous_state: (p.previous_state as WorkflowContext["previous_state"]) ?? null,
     current_pr: (p.current_pr as WorkflowContext["current_pr"]) ?? null,
     feature_branch: (p.feature_branch as WorkflowContext["feature_branch"]) ?? null,
@@ -78,28 +93,89 @@ export function loadState(): WorkflowContext {
   };
 
   // Persist migration so the file is always current schema version
-  if (migrated) {
+  if (migratedV2 || migratedV3) {
     writeState(result);
   }
 
   return result;
 }
 
-/** Persist workflow state. Writes atomically via temp file + rename. */
+/** Persist workflow state. Writes atomically via temp file + rename.
+ *
+ * Validates that in-flight artifacts are preserved before writing.
+ * Throws if the context would drop artifacts present in the on-disk state. */
 export function writeState(ctx: WorkflowContext): void {
+  // Layer 1: artifact preservation — refuse to write if artifacts would be lost
+  if (existsSync(STATE_PATH)) {
+    try {
+      const onDisk = JSON.parse(readFileSync(STATE_PATH, "utf-8")) as Record<string, unknown>;
+      const onDiskArtifacts = (onDisk.artifacts as Record<string, unknown>) ?? {};
+      const ctxArtifacts = (ctx.artifacts as Record<string, unknown>) ?? {};
+      const missing = Object.keys(onDiskArtifacts).filter(k => !(k in ctxArtifacts));
+      if (missing.length > 0) {
+        throw new Error(
+          `Refusing to write state: ${missing.length} artifact(s) would be lost: ${missing.join(", ")}. ` +
+          `Ensure the caller used loadState() before modifying context.`
+        );
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith("Refusing to write state")) throw err;
+      // If on-disk state is unreadable, proceed — the corruption recovery path handles this
+    }
+  }
+
   const dir = dirname(STATE_PATH);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
   const json = JSON.stringify(ctx, null, 2);
-  // Write to a temp file in the same directory, then atomically rename.
-  // Using the same dir avoids cross-filesystem rename failures.
   const tmp = resolve(dir, `.state-tmp-${randomUUID()}.json`);
   writeFileSync(tmp, json, "utf-8");
   renameSync(tmp, STATE_PATH);
 }
 
+// ── Transition Helper ─────────────────────────────────────────────────
+
+/** Encapsulate loadState() → modify → writeState() pattern.
+ *
+ * Layer 2 defense: makes the correct pattern the obvious path.
+ * Callers that construct partial contexts without loadState() stand out.
+ *
+ * Returns the new state string on success. */
+export function transitionState(
+  role: Role,
+  target: string,
+  reason?: string,
+): string {
+  const ctx = loadState();
+  const previousState = ctx.state;
+
+  // Append to state history
+  const entry: StateTransition = {
+    from: previousState,
+    to: target as StateTransition["to"],
+    at: new Date().toISOString(),
+    by: role,
+  };
+  if (reason) entry.reason = reason;
+
+  ctx.state_history = [...(ctx.state_history ?? []), entry];
+  // Keep last 50 entries to bound growth
+  if (ctx.state_history.length > 50) {
+    ctx.state_history = ctx.state_history.slice(-50);
+  }
+
+  ctx.previous_state = previousState;
+  ctx.state = target as WorkflowContext["state"];
+  ctx.transitioned_at = entry.at;
+  ctx.transitioned_by = role;
+
+  writeState(ctx);
+  return target;
+}
+
 // ── Schema Validation ───────────────────────────────────────────────
+
 
 function isValidWorkflowContext(raw: unknown): boolean {
   if (raw === null || typeof raw !== "object") return false;
@@ -133,6 +209,11 @@ function isValidWorkflowContext(raw: unknown): boolean {
 
   // findings_history must be an array if present
   if (r.findings_history !== undefined && !Array.isArray(r.findings_history)) {
+    return false;
+  }
+
+  // state_history must be an array if present (v3+)
+  if (r.state_history !== undefined && !Array.isArray(r.state_history)) {
     return false;
   }
 

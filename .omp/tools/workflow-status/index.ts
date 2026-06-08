@@ -50,6 +50,17 @@ const factory: CustomToolFactory = (pi) => ({
       ? "Write a design doc and seal it with artifact_seal(key=\"design-doc\"), then run Planner-Council review. See .omp/agents/planner.md."
       : null;
 
+    // Build state history summary
+    const historyLines: string[] = [];
+    if ((ctx.state_history ?? []).length > 0) {
+      const last3 = (ctx.state_history ?? []).slice(-3);
+      historyLines.push(`State history (last ${last3.length} of ${ctx.state_history!.length}):`);
+      for (const t of last3) {
+        const reasonSuffix = t.reason ? ` (${t.reason})` : "";
+        historyLines.push(`  ${t.from} → ${t.to} by ${t.by} at ${t.at}${reasonSuffix}`);
+      }
+    }
+
     const text = [
       `State: ${ctx.state}`,
       ctx.previous_state ? `Previous: ${ctx.previous_state}` : null,
@@ -60,17 +71,17 @@ const factory: CustomToolFactory = (pi) => ({
       `Council sign-off: ${formatApproval(ctx.council_sign_off)}`,
       `Operator approval: ${formatApproval(ctx.operator_approval)}`,
       ...findingsLines,
+      ...historyLines,
       nextAction ? `Next: ${nextAction}` : null,
       ctx.transitioned_at ? `Last transition: ${ctx.transitioned_at}` : null,
     ]
-      .filter(Boolean)
-      .join("\n");
 
     return {
       content: [{ type: "text", text }],
       details: {
         state: ctx.state,
         previous_state: ctx.previous_state,
+        state_history: ctx.state_history ?? [],
         feature_branch: ctx.feature_branch,
         current_pr: ctx.current_pr,
         artifacts: artifactSummary,
