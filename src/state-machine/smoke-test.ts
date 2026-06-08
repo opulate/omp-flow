@@ -13,6 +13,8 @@ import {
   guardImplementingToAwaitingCouncil,
   guardAwaitingCouncilToValidating,
   guardValidatingToRetro,
+  guardRetroToAwaitingMerge,
+  guardAwaitingMergeToDone,
 } from "./guards.js";
 import { createWorkflowMachine } from "./machine.js";
 import { createActor } from "xstate";
@@ -224,7 +226,70 @@ result = guardValidatingToRetro(ctx4n);
 assert(result.allowed, "validating→retro: passes with validation report");
 unlinkSync(vReportPath);
 
-// ── 5. XState Machine ─────────────────────────────────────────────
+// 4p. Validating → Retro — hash mismatch (report modified after sealing)
+const vReportPath2 = ".omp/workflow/_test-vreport2.md";
+writeFileSync(vReportPath2, "Validation passed: all assertions OK.");
+const ctx4p = createInitialContext();
+ctx4p.state = "VALIDATING";
+ctx4p.artifacts["validation-report"] = {
+  path: vReportPath2,
+  hash: computeHashString("Validation passed: all assertions OK."),
+  sealed_at: new Date().toISOString(),
+  sealed_by: "Validator",
+};
+// Modify the report after sealing
+writeFileSync(vReportPath2, "Validation passed: MODIFIED AFTER SEAL.");
+result = guardValidatingToRetro(ctx4p);
+assert(!result.allowed, "validating→retro: blocked on hash mismatch");
+unlinkSync(vReportPath2);
+
+// 4q. Council → Validating — hash mismatch (report modified after sealing)
+const councilReportPath2 = ".omp/workflow/_test-council-report2.md";
+writeFileSync(councilReportPath2, "Council report: all clear.");
+const ctx4q = createInitialContext();
+ctx4q.state = "AWAITING_COUNCIL_REVIEW";
+ctx4q.artifacts["council-report"] = {
+  path: councilReportPath2,
+  hash: computeHashString("Council report: all clear."),
+  sealed_at: new Date().toISOString(),
+  sealed_by: "Council",
+};
+// Modify report after sealing
+writeFileSync(councilReportPath2, "Council report: MODIFIED AFTER SEAL.");
+result = guardAwaitingCouncilToValidating(ctx4q);
+assert(!result.allowed, "council→validating: blocked on hash mismatch");
+unlinkSync(councilReportPath2);
+
+// 4r. Retro → Awaiting Merge — basic pass
+const retroPath = ".omp/workflow/_test-retro.md";
+writeFileSync(retroPath, "Retro: all good.");
+const ctx4r = createInitialContext();
+ctx4r.state = "RETRO";
+result = guardRetroToAwaitingMerge(ctx4r);
+assert(!result.allowed, "retro→merge: blocked without retro doc");
+ctx4r.artifacts["retro-doc"] = {
+  path: retroPath,
+  hash: computeHashString("Retro: all good."),
+  sealed_at: new Date().toISOString(),
+  sealed_by: "Retro",
+};
+result = guardRetroToAwaitingMerge(ctx4r);
+assert(result.allowed, "retro→merge: passes with sealed retro doc");
+
+// 4s. Retro → Awaiting Merge — hash mismatch
+writeFileSync(retroPath, "Retro: MODIFIED AFTER SEAL.");
+result = guardRetroToAwaitingMerge(ctx4r);
+assert(!result.allowed, "retro→merge: blocked on hash mismatch");
+unlinkSync(retroPath);
+
+// 4t. Awaiting Merge → Done
+const ctx4t = createInitialContext();
+ctx4t.state = "AWAITING_MERGE";
+result = guardAwaitingMergeToDone(ctx4t);
+assert(!result.allowed, "merge→done: blocked without operator approval");
+ctx4t.operator_approval = true;
+result = guardAwaitingMergeToDone(ctx4t);
+assert(result.allowed, "merge→done: passes with operator approval");
 console.log("\n5. XState Machine");
 
 const testMachine = createWorkflowMachine(createInitialContext());

@@ -96,6 +96,26 @@ const factory: CustomToolFactory = (pi) => ({
     const currentState = ctx.state;
     const target = params.target as TransitionTarget;
 
+    // ── BLOCKED: allow reset to previous state ───────────────────
+    if (currentState === "BLOCKED") {
+      const resetTarget = ctx.previous_state ?? "PLANNING";
+      if (target !== resetTarget) {
+        return {
+          content: [{ type: "text", text: `Cannot transition from BLOCKED to ${target}. Reset target must be ${resetTarget} (previous state).` }],
+          details: { success: false, from: currentState, to: null, error: `From BLOCKED, only reset to ${resetTarget} is allowed.` },
+        };
+      }
+      ctx.previous_state = "BLOCKED";
+      ctx.state = resetTarget;
+      ctx.transitioned_at = new Date().toISOString();
+      ctx.transitioned_by = params.role as Role;
+      writeState(ctx);
+      return {
+        content: [{ type: "text", text: `State reset: BLOCKED → ${resetTarget}\nReset by: ${params.role}\nAt: ${ctx.transitioned_at}` }],
+        details: { success: true, from: "BLOCKED", to: resetTarget },
+      };
+    }
+
     // Validate the transition is structurally valid
     const validTargets = VALID_TARGETS[currentState] ?? [];
     if (!validTargets.includes(target)) {

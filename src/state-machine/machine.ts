@@ -19,7 +19,6 @@ import {
   guardRetroToAwaitingMerge,
   guardAwaitingMergeToDone,
   guardToBlocked,
-  guardBlockedToPrevious,
 } from "./guards.js";
 
 // ── Events ──────────────────────────────────────────────────────────
@@ -62,8 +61,6 @@ export function createWorkflowMachine(initialContext: WorkflowContext) {
         guardAwaitingMergeToDone(context).allowed,
       canTransitionToBlocked: ({ context }) =>
         guardToBlocked(context).allowed,
-      canResetFromBlocked: ({ context }) =>
-        guardBlockedToPrevious(context).allowed,
     },
   }).createMachine({
     id: "omp-workflow",
@@ -290,8 +287,10 @@ export function createWorkflowMachine(initialContext: WorkflowContext) {
 
       BLOCKED: {
         on: {
+          // RESET from BLOCKED always goes to PLANNING in the machine.
+          // The workflow_transition tool handles restoring the actual
+          // previous_state when the operator issues a reset.
           RESET: {
-            guard: { type: "canResetFromBlocked" },
             target: "PLANNING",
             actions: assign({
               state: "PLANNING",

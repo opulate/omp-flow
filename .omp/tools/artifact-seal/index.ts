@@ -38,6 +38,7 @@ const factory: CustomToolFactory = (pi) => ({
     }
 
     const ctx = loadState();
+    const previousSeal = ctx.artifacts[params.key];
     const sealedAt = new Date().toISOString();
     ctx.artifacts[params.key] = {
       path: params.path,
@@ -48,12 +49,15 @@ const factory: CustomToolFactory = (pi) => ({
     writeState(ctx);
 
     const text = [
-      `Artifact sealed: ${params.key}`,
+      previousSeal
+        ? `Artifact re-sealed: ${params.key} (previous hash: ${previousSeal.hash.slice(0, 16)}..., sealed by ${previousSeal.sealed_by} at ${previousSeal.sealed_at})`
+        : `Artifact sealed: ${params.key}`,
       `Path: ${params.path}`,
       `SHA-256: ${hash}`,
       `Sealed at: ${sealedAt}`,
       `Sealed by: ${params.role}`,
     ].join("\n");
+
 
     return {
       content: [{ type: "text", text }],

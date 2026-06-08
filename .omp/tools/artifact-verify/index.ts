@@ -18,8 +18,7 @@ const factory: CustomToolFactory = (pi) => ({
       .describe(
         "Artifact key to verify (e.g. 'design-doc', 'impl-complete', 'validation-contract')"
       ),
-    path: pi.zod.string().describe("Path to the file to verify (used if key not found)"),
-  }),
+    path: pi.zod.string().describe("Path to the file to verify. Defaults to the stored path when the key is found."),
 
   async execute(_toolCallId, params) {
     const ctx = loadState();
