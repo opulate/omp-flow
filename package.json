@@ -1,0 +1,17 @@
+{
+  "name": "omp-flow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "xstate": "^5.0.0"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "*",
+    "@types/bun": "^1.0.0",
+    "typescript": "^5.4.0"
+  }
+}
