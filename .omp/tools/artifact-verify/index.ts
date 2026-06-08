@@ -24,8 +24,10 @@ const factory: CustomToolFactory = (pi) => ({
   async execute(_toolCallId, params) {
     const ctx = loadState();
     const stored = ctx.artifacts[params.key] ?? null;
+    // Use stored path when key exists, fall back to caller-provided path
+    const verifyPath = stored?.path ?? params.path;
     const storedHash = stored?.hash ?? null;
-    const computedHash = computeHash(params.path);
+    const computedHash = computeHash(verifyPath);
 
     if (computedHash === null) {
       return {

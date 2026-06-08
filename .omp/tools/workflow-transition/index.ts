@@ -9,6 +9,7 @@
  * 5. On fail: return structured error with reason
  */
 import type { CustomToolFactory } from "@oh-my-pi/pi-coding-agent";
+import { createActor } from "xstate";
 import { loadState, writeState } from "../../../src/integrity/state-persistence.js";
 import { createWorkflowMachine } from "../../../src/state-machine/machine.js";
 import type {
@@ -165,20 +166,17 @@ const factory: CustomToolFactory = (pi) => ({
       };
     }
 
-    // Transition passes — advance state
+    // Transition passes — advance state via XState machine, then persist
     const previousState = currentState;
     ctx.state = target;
     ctx.previous_state = previousState;
     ctx.transitioned_at = new Date().toISOString();
     ctx.transitioned_by = params.role as Role;
-    writeState(ctx);
 
-    const text = `State transitioned: ${previousState} → ${target}\nTransitioned by: ${params.role}\nAt: ${ctx.transitioned_at}`;
-
-    // Also advance the XState machine for correctness (keeps context in sync)
+    // Advance the machine to keep context in sync (uses createActor to avoid crash)
     const machine = createWorkflowMachine(ctx);
-    const snapshot = machine.getInitialSnapshot();
-    // Send the TRANSITION event
+    const actor = createActor(machine);
+    const snapshot = actor.getSnapshot();
     const nextSnapshot = machine.transition(snapshot, {
       type: "TRANSITION",
       target,
@@ -186,8 +184,12 @@ const factory: CustomToolFactory = (pi) => ({
     });
     if (nextSnapshot.context) {
       Object.assign(ctx, nextSnapshot.context);
-      writeState(ctx);
     }
+
+    // Single atomic write
+    writeState(ctx);
+
+    const text = `State transitioned: ${previousState} → ${target}\nTransitioned by: ${params.role}\nAt: ${ctx.transitioned_at}`;
 
     return {
       content: [{ type: "text", text }],

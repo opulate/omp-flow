@@ -162,6 +162,21 @@ export function guardAwaitingCouncilToValidating(ctx: WorkflowContext): GuardRes
     return { allowed: false, reason: "No council-report artifact sealed." };
   }
 
+  // Verify the report file hasn't been modified since sealing
+  if (!reportArtifact.hash) {
+    return { allowed: false, reason: "Council-report artifact has no recorded hash." };
+  }
+  const currentHash = computeHash(reportArtifact.path);
+  if (currentHash === null) {
+    return { allowed: false, reason: `Council report not found at path: ${reportArtifact.path}` };
+  }
+  if (currentHash !== reportArtifact.hash) {
+    return {
+      allowed: false,
+      reason: "Council report has been modified since sealing. Re-seal before transitioning.",
+    };
+  }
+
   const p0p1Open = ctx.findings_open.filter(
     (f: CouncilFinding) => f.severity === "P0" || f.severity === "P1"
   );
@@ -174,7 +189,7 @@ export function guardAwaitingCouncilToValidating(ctx: WorkflowContext): GuardRes
     };
   }
 
-  // Check that all P0/P1 findings (including closed ones in the report) have realistic trigger conditions
+  // Check that all P0/P1 findings have realistic trigger conditions
   for (const finding of ctx.findings_open) {
     if (finding.severity === "P0" || finding.severity === "P1") {
       if (!finding.trigger_conditions || finding.trigger_conditions.trim().length === 0) {
@@ -250,13 +265,29 @@ export function guardValidatingToImplementing(_ctx: WorkflowContext): GuardResul
 /**
  * Guard: RETRO → AWAITING_MERGE
  *
- * Retro document exists. Always allowed from RETRO.
+ * Retro document sealed and unmodified. Hash verified.
  */
 export function guardRetroToAwaitingMerge(ctx: WorkflowContext): GuardResult {
   const retroArtifact = ctx.artifacts["retro-doc"];
   if (!retroArtifact) {
     return { allowed: false, reason: "No retro-doc artifact sealed." };
   }
+
+  // Verify the retro doc hasn't been modified since sealing
+  if (!retroArtifact.hash) {
+    return { allowed: false, reason: "Retro-doc artifact has no recorded hash." };
+  }
+  const currentHash = computeHash(retroArtifact.path);
+  if (currentHash === null) {
+    return { allowed: false, reason: `Retro doc not found at path: ${retroArtifact.path}` };
+  }
+  if (currentHash !== retroArtifact.hash) {
+    return {
+      allowed: false,
+      reason: "Retro doc has been modified since sealing. Re-seal before transitioning.",
+    };
+  }
+
   return { allowed: true };
 }
 

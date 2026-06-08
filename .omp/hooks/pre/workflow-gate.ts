@@ -54,7 +54,8 @@ export default function (pi: HookAPI) {
 
     // ── AWAITING_COUNCIL_REVIEW: block code changes ─────────────
     if (state.state === "AWAITING_COUNCIL_REVIEW") {
-      if (MODIFYING_TOOLS.has(event.toolName)) {
+      const reviewBlockedTools = new Set(["write", "edit", "ast_edit", "bash"]);
+      if (reviewBlockedTools.has(event.toolName)) {
         return {
           block: true,
           reason: `Cannot modify code during AWAITING_COUNCIL_REVIEW. Address Council findings or transition back to IMPLEMENTING first.`,

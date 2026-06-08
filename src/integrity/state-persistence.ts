@@ -4,7 +4,6 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { WorkflowContext } from "../state-machine/types.js";
 import { createInitialContext } from "../state-machine/types.js";
@@ -47,7 +46,9 @@ export function writeState(ctx: WorkflowContext): void {
     mkdirSync(dir, { recursive: true });
   }
   const json = JSON.stringify(ctx, null, 2);
-  const tmp = resolve(tmpdir(), `omp-workflow-state-${randomUUID()}.json`);
+  // Write to a temp file in the same directory, then atomically rename.
+  // Using the same dir avoids cross-filesystem rename failures.
+  const tmp = resolve(dir, `.state-tmp-${randomUUID()}.json`);
   writeFileSync(tmp, json, "utf-8");
   renameSync(tmp, STATE_PATH);
 }
