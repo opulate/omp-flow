@@ -29,15 +29,38 @@ const factory: CustomToolFactory = (pi) => ({
       (f) => f.severity === "P0" || f.severity === "P1"
     ).length;
 
+    // Build findings summary
+    const findingsLines: string[] = [];
+    if (ctx.findings_open.length > 0) {
+      findingsLines.push(`Open findings: ${ctx.findings_open.length} (${p0p1Count} P0/P1)`);
+      for (const f of ctx.findings_open) {
+        findingsLines.push(`  [${f.severity}] ${f.description}`);
+      }
+    }
+
+    // Format approval status for text display
+    const formatApproval = (a: typeof ctx.council_sign_off): string => {
+      if (!a) return "pending";
+      if (!a.approved) return `denied by ${a.approved_by} at ${a.approved_at}`;
+      return `approved by ${a.approved_by} at ${a.approved_at} (${a.method})`;
+    };
+
+    // First-run guidance when PLANNING with no artifacts
+    const nextAction = (ctx.state === "PLANNING" && Object.keys(ctx.artifacts).length === 0)
+      ? "Write a design doc and seal it with artifact_seal(key=\"design-doc\"), then run Planner-Council review. See .omp/agents/planner.md."
+      : null;
+
     const text = [
       `State: ${ctx.state}`,
       ctx.previous_state ? `Previous: ${ctx.previous_state}` : null,
       ctx.feature_branch ? `Branch: ${ctx.feature_branch}` : null,
       ctx.current_pr ? `PR: ${ctx.current_pr}` : null,
+      ctx.block_reason ? `Block reason: ${ctx.block_reason}` : null,
       `Artifacts sealed: ${Object.keys(ctx.artifacts).length}`,
-      `Open findings: ${ctx.findings_open.length} (${p0p1Count} P0/P1)`,
-      `Council sign-off: ${ctx.council_sign_off ?? "pending"}`,
-      `Operator approval: ${ctx.operator_approval ?? "pending"}`,
+      `Council sign-off: ${formatApproval(ctx.council_sign_off)}`,
+      `Operator approval: ${formatApproval(ctx.operator_approval)}`,
+      ...findingsLines,
+      nextAction ? `Next: ${nextAction}` : null,
       ctx.transitioned_at ? `Last transition: ${ctx.transitioned_at}` : null,
     ]
       .filter(Boolean)
@@ -51,10 +74,11 @@ const factory: CustomToolFactory = (pi) => ({
         feature_branch: ctx.feature_branch,
         current_pr: ctx.current_pr,
         artifacts: artifactSummary,
-        findings_open_count: ctx.findings_open.length,
-        p0p1_count: p0p1Count,
+        findings_open: ctx.findings_open,
+        block_reason: ctx.block_reason,
         council_sign_off: ctx.council_sign_off,
         operator_approval: ctx.operator_approval,
+        next_action: nextAction,
         transitioned_at: ctx.transitioned_at,
         transitioned_by: ctx.transitioned_by,
       },

@@ -4,21 +4,27 @@
  * Run: bun run src/state-machine/smoke-test.ts
  */
 
-import { createInitialContext } from "./types.js";
+import { createInitialContext, ARTIFACT_KEYS } from "./types.js";
+import type { CouncilFinding, ApprovalRecord } from "./types.js";
 import { loadState, writeState } from "../integrity/state-persistence.js";
-import { computeHash, computeHashString } from "../integrity/hash.js";
+import { computeHash, computeHashString, computeHashWithContent } from "../integrity/hash.js";
 import {
   guardPlanningToAwaitingApproval,
   guardAwaitingApprovalToImplementing,
   guardImplementingToAwaitingCouncil,
   guardAwaitingCouncilToValidating,
+  guardAwaitingCouncilToImplementing,
   guardValidatingToRetro,
+  guardValidatingToImplementing,
   guardRetroToAwaitingMerge,
   guardAwaitingMergeToDone,
+  guardToBlocked,
+  guardBlockedToPrevious,
+  validateContractStructure,
 } from "./guards.js";
 import { createWorkflowMachine } from "./machine.js";
 import { createActor } from "xstate";
-import { writeFileSync, unlinkSync, existsSync } from "node:fs";
+import { writeFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
 
 let passed = 0;
 let failed = 0;
@@ -33,25 +39,63 @@ function assert(condition: boolean, label: string) {
   }
 }
 
+// Helper: create a finding with required lifecycle fields
+function makeFinding(overrides: Partial<CouncilFinding> = {}): CouncilFinding {
+  return {
+    id: "finding-001",
+    severity: "P0",
+    description: "Test finding",
+    trigger_conditions: "Happens when X occurs",
+    artifact_path: "/src/foo.ts",
+    status: "open",
+    raised_at: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+// Helper: create an ApprovalRecord for tests
+function makeApproval(approved: boolean): ApprovalRecord {
+  return {
+    approved,
+    approved_by: "Operator",
+    approved_at: new Date().toISOString(),
+    method: "tool-call",
+  };
+}
+
+// Ensure test directory exists
+const testDir = ".omp/workflow";
+if (!existsSync(testDir)) {
+  mkdirSync(testDir, { recursive: true });
+}
+
 // ── 1. Types & Initial Context ────────────────────────────────────
 console.log("\n1. Types & Initial Context");
 const ctx = createInitialContext();
+assert(ctx.schema_version === 2, "schema_version is 2 (v2 ApprovalRecord)");
 assert(ctx.state === "PLANNING", "initial state is PLANNING");
 assert(ctx.previous_state === null, "no previous state");
 assert(Object.keys(ctx.artifacts).length === 0, "no artifacts");
 assert(ctx.council_sign_off === null, "council_sign_off is null");
 assert(ctx.operator_approval === null, "operator_approval is null");
+assert(ctx.block_reason === null, "block_reason is null");
+assert(Array.isArray(ctx.findings_history), "findings_history is array");
+assert(ctx.findings_history.length === 0, "findings_history is empty");
 
 // ── 2. State Persistence ──────────────────────────────────────────
 console.log("\n2. State Persistence");
 writeState(ctx);
 const loaded = loadState();
 assert(loaded.state === "PLANNING", "round-trip preserves state");
+assert(loaded.schema_version === 2, "round-trip preserves schema_version (v2)");
 assert(loaded.artifacts !== undefined, "round-trip preserves artifacts");
 assert(loaded.findings_open !== undefined, "round-trip preserves findings");
+assert(loaded.block_reason === null, "round-trip preserves block_reason");
 
 // ── 3. SHA-256 Hashing ────────────────────────────────────────────
 console.log("\n3. SHA-256 Hashing");
+
+// 3a. Basic computeHash (backward compat)
 const testFile = ".omp/workflow/_test-file.txt";
 writeFileSync(testFile, "hello world");
 const hash = computeHash(testFile);
@@ -59,12 +103,31 @@ assert(hash !== null, "hash computed for existing file");
 assert(hash!.length === 64, "SHA-256 produces 64-char hex string");
 assert(hash === computeHashString("hello world"), "file hash matches string hash of content");
 
+// 3b. Missing file
 const missingHash = computeHash(".omp/workflow/_nonexistent.txt");
 assert(missingHash === null, "null for nonexistent file");
 
+// 3c. Modified file produces different hash
 writeFileSync(testFile, "hello world 2");
 const hash2 = computeHash(testFile);
 assert(hash !== hash2, "modified file produces different hash");
+
+// 3d. computeHashWithContent — discriminated result
+const hashResult = computeHashWithContent(testFile);
+assert(hashResult.status === "ok", "computeHashWithContent returns ok for existing file");
+if (hashResult.status === "ok") {
+  assert(hashResult.hash.length === 64, "computeHashWithContent hash is 64-char hex");
+  assert(hashResult.content === "hello world 2", "computeHashWithContent returns file content");
+  assert(hashResult.hash === computeHash(testFile), "computeHashWithContent hash matches computeHash");
+}
+
+// 3e. computeHashWithContent — not found
+const missingResult = computeHashWithContent(".omp/workflow/_nonexistent.txt");
+assert(missingResult.status === "not_found", "computeHashWithContent returns not_found for missing file");
+
+// 3f. computeHashWithContent — error on directory
+const dirResult = computeHashWithContent(".omp/workflow");
+assert(dirResult.status === "error", "computeHashWithContent returns error for directory");
 unlinkSync(testFile);
 
 // ── 4. Guards ─────────────────────────────────────────────────────
@@ -76,14 +139,14 @@ let result = guardPlanningToAwaitingApproval(ctx4a);
 assert(!result.allowed, "planning→approval: blocked without council sign-off");
 
 // 4b. With council sign-off but no design doc
-ctx4a.council_sign_off = true;
+ctx4a.council_sign_off = makeApproval(true);
 result = guardPlanningToAwaitingApproval(ctx4a);
 assert(!result.allowed, "planning→approval: blocked without design doc");
 
-// 4c. With sealed design doc and council sign-off
+// 4c. With sealed design doc and council sign-off — passes
 const designDocPath = ".omp/workflow/_test-design.md";
 writeFileSync(designDocPath, "# Design Doc\n\nPhase 1 plan.");
-ctx4a.artifacts["design-doc"] = {
+ctx4a.artifacts[ARTIFACT_KEYS.DESIGN_DOC] = {
   path: designDocPath,
   hash: computeHashString("# Design Doc\n\nPhase 1 plan."),
   sealed_at: new Date().toISOString(),
@@ -103,193 +166,284 @@ result = guardPlanningToAwaitingApproval(ctx4a);
 assert(result.allowed, "planning→approval: passes after restore");
 unlinkSync(designDocPath);
 
-// 4e. Awaiting Approval → Implementing — blocked without operator approval
-const ctx4e = createInitialContext();
-ctx4e.state = "AWAITING_OPERATOR_APPROVAL";
-result = guardAwaitingApprovalToImplementing(ctx4e);
-assert(!result.allowed, "approval→implementing: blocked without operator approval");
+// 4e. Council sign-off null vs false — distinct messages
+const ctx4eMsg = createInitialContext();
+result = guardPlanningToAwaitingApproval(ctx4eMsg);
+assert(!result.allowed, "planning→approval: council_sign_off null blocked");
+assert(result.reason!.includes("pending"), "planning→approval: message says pending for null");
 
-// 4f. With operator approval but no contract
-ctx4e.operator_approval = true;
-result = guardAwaitingApprovalToImplementing(ctx4e);
+// 4f. Awaiting Approval → Implementing — blocked without operator approval
+const ctx4f = createInitialContext();
+ctx4f.state = "AWAITING_OPERATOR_APPROVAL";
+result = guardAwaitingApprovalToImplementing(ctx4f);
+assert(!result.allowed, "approval→implementing: blocked without operator approval");
+assert(result.reason!.includes("pending"), "approval→implementing: message says pending for null");
+
+// 4g. Operator approval explicitly denied
+ctx4f.operator_approval = makeApproval(false);
+result = guardAwaitingApprovalToImplementing(ctx4f);
+assert(!result.allowed, "approval→implementing: blocked on denied");
+assert(result.reason!.includes("denied"), "approval→implementing: message says denied for false");
+
+// 4h. With operator approval but no contract
+ctx4f.operator_approval = makeApproval(true);
+result = guardAwaitingApprovalToImplementing(ctx4f);
 assert(!result.allowed, "approval→implementing: blocked without contract");
 
-// 4g. With contract — passes
+// 4i. With structured contract — passes (Phase 2)
 const contractPath = ".omp/workflow/_test-contract.md";
-writeFileSync(contractPath, "Contract: validate touched files only.");
-ctx4e.artifacts["validation-contract"] = {
+const contractJson = JSON.stringify({
+  version: 1,
+  scope: { files: ["src/state-machine/types.ts", "src/state-machine/guards.ts"] },
+  assertions: [{ type: "typecheck", description: "bun run typecheck" }],
+});
+const contractContent = "```json\n" + contractJson + "\n```\n";
+writeFileSync(contractPath, contractContent);
+ctx4f.artifacts[ARTIFACT_KEYS.VALIDATION_CONTRACT] = {
   path: contractPath,
-  hash: computeHashString("Contract: validate touched files only."),
+  hash: computeHashString(contractContent),
   sealed_at: new Date().toISOString(),
   sealed_by: "Planner",
 };
-result = guardAwaitingApprovalToImplementing(ctx4e);
-assert(result.allowed, "approval→implementing: passes with approval + contract");
-unlinkSync(contractPath);
+result = guardAwaitingApprovalToImplementing(ctx4f);
+assert(result.allowed, "approval→implementing: passes with approval + structured contract");
 
-// 4h. Delta-scope check — repo-wide contract blocked
-const ctx4h = createInitialContext();
-ctx4h.state = "AWAITING_OPERATOR_APPROVAL";
-ctx4h.operator_approval = true;
-const wideContractPath = ".omp/workflow/_test-wide-contract.md";
-writeFileSync(wideContractPath, "Run tests on all files in **\/*.ts");
-ctx4h.artifacts["validation-contract"] = {
-  path: wideContractPath,
-  hash: computeHashString("Run tests on all files in **\/*.ts"),
-  sealed_at: new Date().toISOString(),
-  sealed_by: "Planner",
-};
-result = guardAwaitingApprovalToImplementing(ctx4h);
-assert(!result.allowed, "approval→implementing: blocked on repo-wide contract");
-unlinkSync(wideContractPath);
-
-// 4i. Implementing → Council — blocked without impl-complete
-const ctx4i = createInitialContext();
-ctx4i.state = "IMPLEMENTING";
-ctx4i.feature_branch = "feat/omp-flow-phase-1";
-result = guardImplementingToAwaitingCouncil(ctx4i);
+// 4j. Implementing → Council — blocked without impl-complete
+const ctx4j = createInitialContext();
+ctx4j.state = "IMPLEMENTING";
+ctx4j.feature_branch = "feat/omp-flow-phase-1";
+result = guardImplementingToAwaitingCouncil(ctx4j);
 assert(!result.allowed, "implementing→council: blocked without impl-complete");
 
-// 4j. With impl-complete + feature branch — passes
+// 4k. With impl-complete + feature branch — passes
 const implPath = ".omp/workflow/_test-impl.md";
 writeFileSync(implPath, "Implementation complete.");
-ctx4i.artifacts["impl-complete"] = {
+ctx4j.artifacts[ARTIFACT_KEYS.IMPL_COMPLETE] = {
   path: implPath,
   hash: computeHashString("Implementation complete."),
   sealed_at: new Date().toISOString(),
   sealed_by: "Implementor",
 };
-result = guardImplementingToAwaitingCouncil(ctx4i);
+result = guardImplementingToAwaitingCouncil(ctx4j);
 assert(result.allowed, "implementing→council: passes with impl-complete + feature branch");
 unlinkSync(implPath);
 
-// 4k. Implementing on main — blocked
-const ctx4k = createInitialContext();
-ctx4k.state = "IMPLEMENTING";
-ctx4k.feature_branch = "main";
+// 4l. Implementing on "main" — blocked
+const ctx4l = createInitialContext();
+ctx4l.state = "IMPLEMENTING";
+ctx4l.feature_branch = "main";
 const implPath2 = ".omp/workflow/_test-impl2.md";
 writeFileSync(implPath2, "Implementation complete.");
-ctx4k.artifacts["impl-complete"] = {
+ctx4l.artifacts[ARTIFACT_KEYS.IMPL_COMPLETE] = {
   path: implPath2,
   hash: computeHashString("Implementation complete."),
   sealed_at: new Date().toISOString(),
   sealed_by: "Implementor",
 };
-result = guardImplementingToAwaitingCouncil(ctx4k);
+result = guardImplementingToAwaitingCouncil(ctx4l);
 assert(!result.allowed, "implementing→council: blocked on main branch");
 unlinkSync(implPath2);
 
-// 4l. Council → Validating — blocked with open P0
-const ctx4l = createInitialContext();
-ctx4l.state = "AWAITING_COUNCIL_REVIEW";
+// 4m. Implementing on "master" — blocked
+const ctx4m = createInitialContext();
+ctx4m.state = "IMPLEMENTING";
+ctx4m.feature_branch = "master";
+const implPath3 = ".omp/workflow/_test-impl3.md";
+writeFileSync(implPath3, "Implementation complete.");
+ctx4m.artifacts[ARTIFACT_KEYS.IMPL_COMPLETE] = {
+  path: implPath3,
+  hash: computeHashString("Implementation complete."),
+  sealed_at: new Date().toISOString(),
+  sealed_by: "Implementor",
+};
+result = guardImplementingToAwaitingCouncil(ctx4m);
+assert(!result.allowed, "implementing→council: blocked on master branch");
+unlinkSync(implPath3);
+
+// 4n. Implementing → Council — blocked with unaddressed P0 findings
+const ctx4n = createInitialContext();
+ctx4n.state = "IMPLEMENTING";
+ctx4n.feature_branch = "feat/fix-findings";
+const implPath4 = ".omp/workflow/_test-impl4.md";
+writeFileSync(implPath4, "Implementation complete.");
+ctx4n.artifacts[ARTIFACT_KEYS.IMPL_COMPLETE] = {
+  path: implPath4,
+  hash: computeHashString("Implementation complete."),
+  sealed_at: new Date().toISOString(),
+  sealed_by: "Implementor",
+};
+ctx4n.findings_open = [
+  makeFinding({ id: "f-1", severity: "P0", description: "Critical bug", status: "open" }),
+];
+result = guardImplementingToAwaitingCouncil(ctx4n);
+assert(!result.allowed, "implementing→council: blocked with unaddressed P0");
+unlinkSync(implPath4);
+
+// 4o. Implementing → Council — passes with addressed findings
+const ctx4o = createInitialContext();
+ctx4o.state = "IMPLEMENTING";
+ctx4o.feature_branch = "feat/fix-findings";
+const implPath5 = ".omp/workflow/_test-impl5.md";
+writeFileSync(implPath5, "Implementation complete.");
+ctx4o.artifacts[ARTIFACT_KEYS.IMPL_COMPLETE] = {
+  path: implPath5,
+  hash: computeHashString("Implementation complete."),
+  sealed_at: new Date().toISOString(),
+  sealed_by: "Implementor",
+};
+ctx4o.findings_open = [
+  makeFinding({ id: "f-1", severity: "P0", description: "Critical bug", status: "addressed", addressed_at: new Date().toISOString() }),
+];
+result = guardImplementingToAwaitingCouncil(ctx4o);
+assert(result.allowed, "implementing→council: passes with addressed P0");
+unlinkSync(implPath5);
+
+// 4p. Council → Validating — blocked with open P0
+const ctx4p = createInitialContext();
+ctx4p.state = "AWAITING_COUNCIL_REVIEW";
 const reportPath = ".omp/workflow/_test-report.md";
 writeFileSync(reportPath, "Council report: 1 P0 finding.");
-ctx4l.artifacts["council-report"] = {
+ctx4p.artifacts[ARTIFACT_KEYS.COUNCIL_REPORT] = {
   path: reportPath,
   hash: computeHashString("Council report: 1 P0 finding."),
   sealed_at: new Date().toISOString(),
   sealed_by: "Council",
 };
-ctx4l.findings_open = [
-  {
-    severity: "P0",
-    description: "Critical bug in auth",
-    trigger_conditions: "Happens on every login with null email",
-    artifact_path: "/src/auth.ts",
-  },
+ctx4p.findings_open = [
+  makeFinding({ id: "f-1", severity: "P0", description: "Critical bug in auth", trigger_conditions: "Happens on every login with null email", artifact_path: "/src/auth.ts", status: "open" }),
 ];
-result = guardAwaitingCouncilToValidating(ctx4l);
+result = guardAwaitingCouncilToValidating(ctx4p);
 assert(!result.allowed, "council→validating: blocked with open P0");
 
-// 4m. Findings resolved — passes
-ctx4l.findings_open = [];
-result = guardAwaitingCouncilToValidating(ctx4l);
+// 4q. Findings resolved — passes
+ctx4p.findings_open = [];
+result = guardAwaitingCouncilToValidating(ctx4p);
 assert(result.allowed, "council→validating: passes with no open findings");
 unlinkSync(reportPath);
 
-// 4n. Validating → Retro — blocked without report
+// 4r. Council → Validating — blocked on P1 without trigger conditions
+const ctx4r = createInitialContext();
+ctx4r.state = "AWAITING_COUNCIL_REVIEW";
+const reportPath2 = ".omp/workflow/_test-report2.md";
+writeFileSync(reportPath2, "Council report.");
+ctx4r.artifacts[ARTIFACT_KEYS.COUNCIL_REPORT] = {
+  path: reportPath2,
+  hash: computeHashString("Council report."),
+  sealed_at: new Date().toISOString(),
+  sealed_by: "Council",
+};
+ctx4r.findings_open = [
+  makeFinding({ id: "f-2", severity: "P1", description: "Slow query", trigger_conditions: "", status: "closed" }),
+];
+result = guardAwaitingCouncilToValidating(ctx4r);
+assert(!result.allowed, "council→validating: blocked on P1 without trigger conditions");
+unlinkSync(reportPath2);
+
+// 4s. Validating → Retro — blocked without report
 const vReportPath = ".omp/workflow/_test-vreport.md";
 writeFileSync(vReportPath, "Validation passed: all assertions OK.");
-const ctx4n = createInitialContext();
-ctx4n.state = "VALIDATING";
-result = guardValidatingToRetro(ctx4n);
+const ctx4s = createInitialContext();
+ctx4s.state = "VALIDATING";
+result = guardValidatingToRetro(ctx4s);
 assert(!result.allowed, "validating→retro: blocked without validation report");
 
-// 4o. With validation report — passes
-ctx4n.artifacts["validation-report"] = {
+// 4t. With validation report — passes
+ctx4s.artifacts[ARTIFACT_KEYS.VALIDATION_REPORT] = {
   path: vReportPath,
   hash: computeHashString("Validation passed: all assertions OK."),
   sealed_at: new Date().toISOString(),
   sealed_by: "Validator",
 };
-result = guardValidatingToRetro(ctx4n);
+result = guardValidatingToRetro(ctx4s);
 assert(result.allowed, "validating→retro: passes with validation report");
 unlinkSync(vReportPath);
 
-// 4p. Validating → Retro — hash mismatch (report modified after sealing)
+// 4u. Validating → Retro — hash mismatch (report modified after sealing)
 const vReportPath2 = ".omp/workflow/_test-vreport2.md";
 writeFileSync(vReportPath2, "Validation passed: all assertions OK.");
-const ctx4p = createInitialContext();
-ctx4p.state = "VALIDATING";
-ctx4p.artifacts["validation-report"] = {
+const ctx4u = createInitialContext();
+ctx4u.state = "VALIDATING";
+ctx4u.artifacts[ARTIFACT_KEYS.VALIDATION_REPORT] = {
   path: vReportPath2,
   hash: computeHashString("Validation passed: all assertions OK."),
   sealed_at: new Date().toISOString(),
   sealed_by: "Validator",
 };
-// Modify the report after sealing
 writeFileSync(vReportPath2, "Validation passed: MODIFIED AFTER SEAL.");
-result = guardValidatingToRetro(ctx4p);
+result = guardValidatingToRetro(ctx4u);
 assert(!result.allowed, "validating→retro: blocked on hash mismatch");
 unlinkSync(vReportPath2);
 
-// 4q. Council → Validating — hash mismatch (report modified after sealing)
-const councilReportPath2 = ".omp/workflow/_test-council-report2.md";
-writeFileSync(councilReportPath2, "Council report: all clear.");
-const ctx4q = createInitialContext();
-ctx4q.state = "AWAITING_COUNCIL_REVIEW";
-ctx4q.artifacts["council-report"] = {
-  path: councilReportPath2,
+// 4v. Council → Validating — hash mismatch (report modified after sealing)
+const councilReportPath3 = ".omp/workflow/_test-council-report3.md";
+writeFileSync(councilReportPath3, "Council report: all clear.");
+const ctx4v = createInitialContext();
+ctx4v.state = "AWAITING_COUNCIL_REVIEW";
+ctx4v.artifacts[ARTIFACT_KEYS.COUNCIL_REPORT] = {
+  path: councilReportPath3,
   hash: computeHashString("Council report: all clear."),
   sealed_at: new Date().toISOString(),
   sealed_by: "Council",
 };
-// Modify report after sealing
-writeFileSync(councilReportPath2, "Council report: MODIFIED AFTER SEAL.");
-result = guardAwaitingCouncilToValidating(ctx4q);
+writeFileSync(councilReportPath3, "Council report: MODIFIED AFTER SEAL.");
+result = guardAwaitingCouncilToValidating(ctx4v);
 assert(!result.allowed, "council→validating: blocked on hash mismatch");
-unlinkSync(councilReportPath2);
+unlinkSync(councilReportPath3);
 
-// 4r. Retro → Awaiting Merge — basic pass
+// 4w. Retro → Awaiting Merge — basic pass
 const retroPath = ".omp/workflow/_test-retro.md";
 writeFileSync(retroPath, "Retro: all good.");
-const ctx4r = createInitialContext();
-ctx4r.state = "RETRO";
-result = guardRetroToAwaitingMerge(ctx4r);
+const ctx4w = createInitialContext();
+ctx4w.state = "RETRO";
+result = guardRetroToAwaitingMerge(ctx4w);
 assert(!result.allowed, "retro→merge: blocked without retro doc");
-ctx4r.artifacts["retro-doc"] = {
+ctx4w.artifacts[ARTIFACT_KEYS.RETRO_DOC] = {
   path: retroPath,
   hash: computeHashString("Retro: all good."),
   sealed_at: new Date().toISOString(),
   sealed_by: "Retro",
 };
-result = guardRetroToAwaitingMerge(ctx4r);
+result = guardRetroToAwaitingMerge(ctx4w);
 assert(result.allowed, "retro→merge: passes with sealed retro doc");
 
-// 4s. Retro → Awaiting Merge — hash mismatch
+// 4x. Retro → Awaiting Merge — hash mismatch
 writeFileSync(retroPath, "Retro: MODIFIED AFTER SEAL.");
-result = guardRetroToAwaitingMerge(ctx4r);
+result = guardRetroToAwaitingMerge(ctx4w);
 assert(!result.allowed, "retro→merge: blocked on hash mismatch");
 unlinkSync(retroPath);
 
-// 4t. Awaiting Merge → Done
-const ctx4t = createInitialContext();
-ctx4t.state = "AWAITING_MERGE";
-result = guardAwaitingMergeToDone(ctx4t);
+// 4y. Awaiting Merge → Done — blocked without approval, distinct messages
+const ctx4y = createInitialContext();
+ctx4y.state = "AWAITING_MERGE";
+result = guardAwaitingMergeToDone(ctx4y);
 assert(!result.allowed, "merge→done: blocked without operator approval");
-ctx4t.operator_approval = true;
-result = guardAwaitingMergeToDone(ctx4t);
+assert(result.reason!.includes("pending"), "merge→done: message says pending for null");
+ctx4y.operator_approval = makeApproval(false);
+result = guardAwaitingMergeToDone(ctx4y);
+assert(!result.allowed, "merge→done: blocked on denied approval");
+assert(result.reason!.includes("denied"), "merge→done: message says denied for false");
+ctx4y.operator_approval = makeApproval(true);
+result = guardAwaitingMergeToDone(ctx4y);
 assert(result.allowed, "merge→done: passes with operator approval");
+
+// 4z. Always-allowed guards
+result = guardAwaitingCouncilToImplementing(createInitialContext());
+assert(result.allowed, "council→implementing: always allowed");
+result = guardValidatingToImplementing(createInitialContext());
+assert(result.allowed, "validating→implementing: always allowed");
+result = guardToBlocked(createInitialContext());
+assert(result.allowed, "any→blocked: always allowed");
+
+// 4aa. guardBlockedToPrevious
+const ctx4aa = createInitialContext();
+ctx4aa.previous_state = "VALIDATING";
+result = guardBlockedToPrevious(ctx4aa);
+assert(result.allowed, "blocked→previous: passes with previous_state");
+ctx4aa.previous_state = null;
+result = guardBlockedToPrevious(ctx4aa);
+assert(!result.allowed, "blocked→previous: blocked without previous_state");
+
+// ── 5. XState Machine ────────────────────────────────────────────
 console.log("\n5. XState Machine");
 
 const testMachine = createWorkflowMachine(createInitialContext());
@@ -299,10 +453,10 @@ assert(snapshot.value === "PLANNING", "machine starts in PLANNING");
 
 // Machine with council sign-off + design doc in context
 const ctx5 = createInitialContext();
-ctx5.council_sign_off = true;
-ctx5.artifacts["design-doc"] = {
-  path: ".omp/workflow/_test-design.md",
-  hash: "placeholder",
+ctx5.council_sign_off = makeApproval(true);
+ctx5.artifacts[ARTIFACT_KEYS.DESIGN_DOC] = {
+  path: ".omp/workflow/_test-design-machine.md",
+  hash: computeHashString("# Test"),
   sealed_at: new Date().toISOString(),
   sealed_by: "Planner",
 };
@@ -311,15 +465,220 @@ const actor2 = createActor(machine2);
 const snap2 = actor2.getSnapshot();
 assert(snap2.value === "PLANNING", "machine initial state matches context state");
 
-// ── 6. Loaded State Integrity ─────────────────────────────────────
-console.log("\n6. State Integrity");
+// ── 6. BLOCK Event Stores block_reason ────────────────────────────
+console.log("\n6. BLOCK Event Stores block_reason");
+const ctx6 = createInitialContext();
+const blockMachine = createWorkflowMachine(ctx6);
+const blockActor = createActor(blockMachine);
+blockActor.start();
+let blockSnap = blockActor.getSnapshot();
+assert(blockSnap.context.block_reason === null, "block_reason initially null");
+
+blockActor.send({ type: "BLOCK", reason: "Guard failed: hash mismatch" });
+blockSnap = blockActor.getSnapshot();
+assert(blockSnap.value === "BLOCKED", "machine transitions to BLOCKED");
+assert(blockSnap.context.block_reason === "Guard failed: hash mismatch", "block_reason stored in context");
+assert(blockSnap.context.previous_state === "PLANNING", "previous_state recorded");
+
+// ── 7. BLOCKED → RESET with guardBlockedToPrevious ────────────────
+console.log("\n7. BLOCKED → RESET");
+
+// 7a. RESET with previous_state set — guard allows, machine goes to PLANNING
+// (the workflow_transition tool reads previous_state before reset to redirect)
+const ctx7a = createInitialContext();
+ctx7a.state = "BLOCKED";
+ctx7a.previous_state = "VALIDATING";
+ctx7a.block_reason = "test block";
+const machine7a = createWorkflowMachine(ctx7a);
+const actor7a = createActor(machine7a);
+actor7a.start();
+let snap7a = actor7a.getSnapshot();
+assert(snap7a.value === "BLOCKED", "machine starts in BLOCKED");
+assert(snap7a.context.previous_state === "VALIDATING", "previous_state preserved for tool redirect");
+
+actor7a.send({ type: "RESET" });
+snap7a = actor7a.getSnapshot();
+assert(snap7a.value === "PLANNING", "BLOCKED RESET goes to PLANNING (tool redirects from here)");
+assert(snap7a.context.block_reason === null, "block_reason cleared on RESET");
+
+// 7b. RESET with previous_state null — guard blocks reset
+const ctx7b = createInitialContext();
+ctx7b.state = "BLOCKED";
+ctx7b.previous_state = null;
+ctx7b.block_reason = "test block";
+const machine7b = createWorkflowMachine(ctx7b);
+const actor7b = createActor(machine7b);
+actor7b.start();
+let snap7b = actor7b.getSnapshot();
+assert(snap7b.value === "BLOCKED", "machine starts in BLOCKED (null prev)");
+
+actor7b.send({ type: "RESET" });
+snap7b = actor7b.getSnapshot();
+assert(snap7b.value === "BLOCKED", "BLOCKED RESET blocked when previous_state is null");
+
+// ── 8. Loaded State Integrity ─────────────────────────────────────
+console.log("\n8. State Integrity");
 const finalCtx = loadState();
 assert(typeof finalCtx.state === "string", "loaded state has valid state string");
 assert(Array.isArray(finalCtx.findings_open), "loaded state has findings array");
+assert(Array.isArray(finalCtx.findings_history), "loaded state has findings_history array");
+assert(typeof finalCtx.schema_version === "number", "loaded state has schema_version");
+assert(finalCtx.block_reason === null || typeof finalCtx.block_reason === "string", "block_reason is null or string");
 
+
+// ── 9. ApprovalRecord — distinct messages for null/denied/approved ───
+console.log("\n9. ApprovalRecord");
+
+// 9a. Null means pending — distinct from denied
+const ctx9a = createInitialContext();
+assert(ctx9a.council_sign_off === null, "council_sign_off is null initially");
+let r9a = guardPlanningToAwaitingApproval(ctx9a);
+assert(!r9a.allowed, "planning→approval: blocked on null council_sign_off");
+assert(r9a.reason!.includes("pending"), "null produces 'pending' message, not 'denied'");
+
+// 9b. Denied approval record
+ctx9a.council_sign_off = makeApproval(false);
+r9a = guardPlanningToAwaitingApproval(ctx9a);
+assert(!r9a.allowed, "planning→approval: blocked on denied council_sign_off");
+assert(r9a.reason!.includes("denied"), "denied approval produces 'denied' message");
+
+// 9c. Approved record passes
+ctx9a.council_sign_off = makeApproval(true);
+const designDoc9 = ".omp/workflow/_test-design-9.md";
+writeFileSync(designDoc9, "# Test");
+ctx9a.artifacts[ARTIFACT_KEYS.DESIGN_DOC] = {
+  path: designDoc9,
+  hash: computeHashString("# Test"),
+  sealed_at: new Date().toISOString(),
+  sealed_by: "Planner",
+};
+r9a = guardPlanningToAwaitingApproval(ctx9a);
+assert(r9a.allowed, "planning→approval: passes with approved record + design doc");
+unlinkSync(designDoc9);
+
+// 9d. Operator approval — null, denied, approved messages
+const ctx9d = createInitialContext();
+ctx9d.state = "AWAITING_OPERATOR_APPROVAL";
+let r9d = guardAwaitingApprovalToImplementing(ctx9d);
+assert(!r9d.allowed, "approval→implementing: blocked on null");
+assert(r9d.reason!.includes("pending"), "null operator approval says pending");
+
+ctx9d.operator_approval = makeApproval(false);
+r9d = guardAwaitingApprovalToImplementing(ctx9d);
+assert(!r9d.allowed, "approval→implementing: blocked on denied");
+assert(r9d.reason!.includes("denied"), "denied operator approval says denied");
+
+// ── 10. Structured Contract Validation ─────────────────────────────
+console.log("\n10. Structured Contract Validation");
+
+// 10a. Valid contract passes (inside markdown fence)
+const validJson = JSON.stringify({
+  version: 1,
+  scope: { files: ["src/foo.ts", "src/bar.ts"] },
+  assertions: [{ type: "test", description: "Run tests" }],
+});
+let cr10a = validateContractStructure("```json\n" + validJson + "\n```\n", "test");
+assert(cr10a === null, "valid structured contract passes validation");
+
+// 10b. No JSON block — rejected
+cr10a = validateContractStructure("# Just a comment\n\nRun tests on src/", "test");
+assert(cr10a !== null, "free-text contract rejected");
+assert(cr10a!.reason!.includes("structured format"), "error mentions structured format");
+
+// 10c. Missing scope.files — rejected
+cr10a = validateContractStructure("```json\n" + JSON.stringify({ version: 1, scope: {}, assertions: [] }) + "\n```", "test");
+assert(cr10a !== null, "contract without scope.files rejected");
+
+// 10d. Empty scope.files — rejected
+cr10a = validateContractStructure("```json\n" + JSON.stringify({
+  version: 1,
+  scope: { files: [] },
+  assertions: [{ type: "test", description: "Run" }],
+}) + "\n```", "test");
+assert(cr10a !== null, "contract with empty scope.files rejected");
+
+// 10e. Globstar pattern — rejected
+cr10a = validateContractStructure("```json\n" + JSON.stringify({
+  version: 1,
+  scope: { files: ["**/*.ts"] },
+  assertions: [{ type: "test", description: "Run" }],
+}) + "\n```", "test");
+assert(cr10a !== null, "contract with globstar rejected");
+assert(cr10a!.reason!.includes("repo-wide"), "error mentions repo-wide pattern");
+
+// 10f. Catch-all pattern — rejected
+cr10a = validateContractStructure("```json\n" + JSON.stringify({
+  version: 1,
+  scope: { files: ["all files"] },
+  assertions: [{ type: "test", description: "Run" }],
+}) + "\n```", "test");
+assert(cr10a !== null, "contract with 'all files' rejected");
+
+// 10g. Missing assertions — rejected
+cr10a = validateContractStructure("```json\n" + JSON.stringify({
+  version: 1,
+  scope: { files: ["src/foo.ts"] },
+  assertions: [],
+}) + "\n```", "test");
+assert(cr10a !== null, "contract with empty assertions rejected");
+
+// 10h. Invalid JSON — rejected
+cr10a = validateContractStructure("```json\n{ not valid json }\n```", "test");
+assert(cr10a !== null, "invalid JSON rejected");
+assert(cr10a!.reason!.includes("invalid JSON"), "error mentions invalid JSON");
+
+// ── 11. BLOCKED Dynamic Target Resolution ──────────────────────────
+console.log("\n11. BLOCKED Dynamic Target");
+
+// 11a. BLOCKED with previous_state = VALIDATING — tool resets to VALIDATING
+const ctx11a = createInitialContext();
+ctx11a.state = "BLOCKED";
+ctx11a.previous_state = "VALIDATING";
+ctx11a.block_reason = "test block";
+const machine11a = createWorkflowMachine(ctx11a);
+const actor11a = createActor(machine11a);
+actor11a.start();
+let snap11a = actor11a.getSnapshot();
+assert(snap11a.value === "BLOCKED", "starts in BLOCKED");
+assert(snap11a.context.previous_state === "VALIDATING", "previous_state preserved for tool");
+
+// The machine's RESET targets PLANNING (the tool handles dynamic override)
+actor11a.send({ type: "RESET" });
+snap11a = actor11a.getSnapshot();
+assert(snap11a.value === "PLANNING", "machine RESET goes to PLANNING (tool overrides this)");
+
+// 11b. BLOCKED with previous_state = null — guard blocks machine reset
+const ctx11b = createInitialContext();
+ctx11b.state = "BLOCKED";
+ctx11b.previous_state = null;
+ctx11b.block_reason = "test block";
+const machine11b = createWorkflowMachine(ctx11b);
+const actor11b = createActor(machine11b);
+actor11b.start();
+actor11b.send({ type: "RESET" });
+const snap11b = actor11b.getSnapshot();
+assert(snap11b.value === "BLOCKED", "BLOCKED RESET blocked when previous_state is null");
 // Cleanup temp files
-const _cleanup = [".omp/workflow/_test-design.md", ".omp/workflow/_test-implementation.md"];
-for (const f of _cleanup) {
+const cleanupFiles = [
+  ".omp/workflow/_test-design.md",
+  ".omp/workflow/_test-implementation.md",
+  ".omp/workflow/_test-design-machine.md",
+  ".omp/workflow/_test-file.txt",
+  ".omp/workflow/_test-contract.md",
+  ".omp/workflow/_test-impl.md",
+  ".omp/workflow/_test-impl2.md",
+  ".omp/workflow/_test-impl3.md",
+  ".omp/workflow/_test-impl4.md",
+  ".omp/workflow/_test-impl5.md",
+  ".omp/workflow/_test-report.md",
+  ".omp/workflow/_test-report2.md",
+  ".omp/workflow/_test-council-report3.md",
+  ".omp/workflow/_test-vreport.md",
+  ".omp/workflow/_test-design-9.md",
+  ".omp/workflow/_test-vreport2.md",
+  ".omp/workflow/_test-retro.md",
+];
+for (const f of cleanupFiles) {
   if (existsSync(f)) unlinkSync(f);
 }
 
@@ -327,7 +686,7 @@ for (const f of _cleanup) {
 console.log(`\n${"─".repeat(40)}`);
 console.log(`Passed: ${passed}  Failed: ${failed}`);
 if (failed > 0) {
-  console.log("SOME TESTS FAILED!");
+  console.log("\nFAILURES DETECTED");
   process.exit(1);
 } else {
   console.log("All tests passed!");

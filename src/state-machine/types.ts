@@ -29,15 +29,8 @@ export const WORKFLOW_STATES: readonly WorkflowState[] = [
 ] as const;
 
 // ── Transition Targets ──────────────────────────────────────────────
-export type TransitionTarget =
-  | "AWAITING_OPERATOR_APPROVAL"
-  | "IMPLEMENTING"
-  | "AWAITING_COUNCIL_REVIEW"
-  | "VALIDATING"
-  | "RETRO"
-  | "AWAITING_MERGE"
-  | "DONE"
-  | "BLOCKED";
+// Valid targets for workflow_transition; excludes initial + error states.
+export type TransitionTarget = Exclude<WorkflowState, "PLANNING" | "ERROR">;
 
 // ── Roles ───────────────────────────────────────────────────────────
 export type Role = "Planner" | "Implementor" | "Council" | "Validator" | "Retro" | "Operator";
@@ -45,12 +38,32 @@ export type Role = "Planner" | "Implementor" | "Council" | "Validator" | "Retro"
 // ── Finding Severity ────────────────────────────────────────────────
 export type FindingSeverity = "P0" | "P1" | "P2" | "P3";
 
-// ── Council Finding ─────────────────────────────────────────────────
+// ── Artifact Keys ───────────────────────────────────────────────────
+// Canonical artifact keys. Use these constants everywhere — never raw strings.
+export const ARTIFACT_KEYS = {
+  DESIGN_DOC: "design-doc",
+  VALIDATION_CONTRACT: "validation-contract",
+  IMPL_COMPLETE: "impl-complete",
+  COUNCIL_REPORT: "council-report",
+  VALIDATION_REPORT: "validation-report",
+  RETRO_DOC: "retro-doc",
+} as const;
+export type ArtifactKey = (typeof ARTIFACT_KEYS)[keyof typeof ARTIFACT_KEYS];
+
+// ── Finding Status ──────────────────────────────────────────────────
+export type FindingStatus = "open" | "addressed" | "closed";
+
+// ── Council Finding (with lifecycle) ────────────────────────────────
 export interface CouncilFinding {
+  id: string; // UUID
   severity: FindingSeverity;
   description: string;
   trigger_conditions: string; // Required for P0/P1 — must describe realistic trigger
   artifact_path: string;
+  status: FindingStatus;
+  raised_at: string;
+  addressed_at?: string;
+  addressed_in?: string; // impl-complete hash reference
 }
 
 // ── Artifact Record ─────────────────────────────────────────────────
@@ -61,16 +74,28 @@ export interface ArtifactRecord {
   sealed_by: Role;
 }
 
+// ── Approval Record ──────────────────────────────────────────────────
+/** Structured approval record replacing bare booleans (Phase 2). */
+export interface ApprovalRecord {
+  approved: boolean;
+  approved_by: Role;
+  approved_at: string;
+  method: "slash-command" | "state-edit" | "tool-call";
+}
+
 // ── Workflow Context (state.json schema) ────────────────────────────
 export interface WorkflowContext {
+  schema_version: number;
   state: WorkflowState;
   previous_state: WorkflowState | null;
   current_pr: string | null;
   feature_branch: string | null;
   artifacts: Record<string, ArtifactRecord>;
-  council_sign_off: boolean | null;
-  operator_approval: boolean | null;
+  council_sign_off: ApprovalRecord | null;
+  operator_approval: ApprovalRecord | null;
   findings_open: CouncilFinding[];
+  findings_history: CouncilFinding[]; // append-only audit trail
+  block_reason: string | null;
   transitioned_at: string | null;
   transitioned_by: Role | null;
 }
@@ -78,6 +103,7 @@ export interface WorkflowContext {
 // ── Initial Context Factory ─────────────────────────────────────────
 export function createInitialContext(): WorkflowContext {
   return {
+    schema_version: 2,
     state: "PLANNING",
     previous_state: null,
     current_pr: null,
@@ -86,6 +112,8 @@ export function createInitialContext(): WorkflowContext {
     council_sign_off: null,
     operator_approval: null,
     findings_open: [],
+    findings_history: [],
+    block_reason: null,
     transitioned_at: null,
     transitioned_by: null,
   };
@@ -97,15 +125,40 @@ export interface GuardResult {
   reason?: string;
 }
 
+// ── Hash Result (discriminated) ─────────────────────────────────────
+export type HashResult =
+  | { status: "ok"; hash: string; content: string }
+  | { status: "not_found" }
+  | { status: "permission_denied"; error: string }
+  | { status: "error"; error: string };
+
+
+// ── Validation Contract (Phase 2 structured format) ──────────────────
+/** Structured validation contract — machine-verifiable format. */
+export interface ValidationContract {
+  version: number;
+  scope: {
+    files: string[];
+  };
+  assertions: ContractAssertion[];
+}
+
+export interface ContractAssertion {
+  type: string;
+  description: string;
+  command?: string;
+}
 // ── Tool Return Types ───────────────────────────────────────────────
 export interface WorkflowStatusResult {
   state: WorkflowState;
   previous_state: WorkflowState | null;
   artifacts: Record<string, { path: string; sealed_at: string; sealed_by: Role }>;
-  findings_open_count: number;
-  council_sign_off: boolean | null;
-  operator_approval: boolean | null;
+  findings_open: CouncilFinding[];
+  block_reason: string | null;
+  council_sign_off: ApprovalRecord | null;
+  operator_approval: ApprovalRecord | null;
   transitioned_at: string | null;
+  available_transitions: TransitionTarget[];
 }
 
 export interface ArtifactSealResult {

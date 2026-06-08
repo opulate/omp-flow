@@ -56,10 +56,52 @@ BLOCKED                → previous state               (operator resets)
 
 ## Tools
 
-- `workflow_status` — read current state
-- `workflow_transition(target, role)` — attempt state transition (guard evaluated)
+- `workflow_status` — read current state (includes findings, approval details, first-run guidance)
+- `workflow_transition(target?, role, action?)` — attempt state transition (guard evaluated)
+  - `action: "approve"` — operator approval from AWAITING_OPERATOR_APPROVAL or AWAITING_MERGE
+  - `action: "reset"` — operator reset from BLOCKED to previous_state
 - `artifact_seal(key, path, role)` — compute SHA-256 and record in state
 - `artifact_verify(key, path)` — recompute hash and compare against stored record
+
+## Approval Records (Phase 2)
+
+Council sign-off and operator approval use structured `ApprovalRecord` with audit trail:
+
+```json
+{
+  "approved": true,
+  "approved_by": "Operator",
+  "approved_at": "2026-06-08T02:21:14.301Z",
+  "method": "slash-command"
+}
+```
+
+`method` is one of: `"slash-command"` (via /workflow approve), `"tool-call"` (via workflow_transition), `"state-edit"` (v1 migration).
+
+## Validation Contract Schema (Phase 2)
+
+Contracts MUST use structured JSON format within a markdown file:
+
+```json
+{
+  "version": 1,
+  "scope": {
+    "files": ["src/state-machine/types.ts", "src/state-machine/guards.ts"]
+  },
+  "assertions": [
+    { "type": "typecheck", "description": "bun run typecheck on scoped files" },
+    { "type": "test", "command": "bun run src/state-machine/smoke-test.ts", "description": "All smoke tests pass" },
+    { "type": "no-extra-files", "description": "No file outside declared scope is modified" }
+  ]
+}
+```
+
+**Rules:**
+- `scope.files` must be a non-empty array of explicit file paths
+- No globstars (`**`), catch-alls (`*`, `all`, `all files`), or repo-wide patterns
+- `assertions` must be non-empty with `type` and `description` per entry
+- Contracts in free-text format are rejected at the AWAITING_OPERATOR_APPROVAL → IMPLEMENTING guard
+- The guard calls `validateContractStructure()` which parses and validates before allowing transition
 
 ## Hook
 

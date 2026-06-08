@@ -25,6 +25,7 @@ import {
   guardValidatingToRetro,
   guardRetroToAwaitingMerge,
   guardAwaitingMergeToDone,
+  guardBlockedToPrevious,
 } from "../../../src/state-machine/guards.js";
 import type { GuardResult } from "../../../src/state-machine/types.js";
 
@@ -85,19 +86,134 @@ const factory: CustomToolFactory = (pi) => ({
         "DONE",
         "BLOCKED",
       ] as const)
-      .describe("Target state to transition to"),
+      .optional()
+      .describe("Target state to transition to (omit for approve/reset actions)"),
     role: pi.zod
       .enum(["Planner", "Implementor", "Council", "Validator", "Retro", "Operator"] as const)
       .describe("Role initiating the transition"),
+    action: pi.zod
+      .enum(["approve", "reset"] as const)
+      .optional()
+      .describe("Operator action: 'approve' to approve and advance, 'reset' to reset from BLOCKED"),
   }),
+
 
   async execute(_toolCallId, params) {
     const ctx = loadState();
     const currentState = ctx.state;
+
+    // ── Operator Actions ─────────────────────────────────────────
+
+    // /workflow approve: record operator approval and advance
+    if (params.action === "approve") {
+      if (params.role !== "Operator") {
+        return {
+          content: [{ type: "text", text: "Only the Operator can approve. Agents cannot self-approve." }],
+          details: { success: false, from: currentState, to: null, error: "Role must be Operator for approve action." },
+        };
+      }
+      if (currentState === "AWAITING_OPERATOR_APPROVAL") {
+        ctx.operator_approval = {
+          approved: true,
+          approved_by: "Operator",
+          approved_at: new Date().toISOString(),
+          method: "slash-command",
+        };
+        // Evaluate the guard — structured contract validation happens here
+        const guardResult = guardAwaitingApprovalToImplementing(ctx);
+        if (!guardResult.allowed) {
+          return {
+            content: [{ type: "text", text: `Approval blocked: ${guardResult.reason}` }],
+            details: { success: false, from: currentState, to: null, error: guardResult.reason },
+          };
+        }
+        ctx.previous_state = currentState;
+        ctx.state = "IMPLEMENTING";
+        ctx.transitioned_at = ctx.operator_approval.approved_at;
+        ctx.transitioned_by = "Operator";
+        writeState(ctx);
+        return {
+          content: [{ type: "text", text: `Approved: ${currentState} → IMPLEMENTING\nApproved by: Operator\nAt: ${ctx.transitioned_at}` }],
+          details: { success: true, from: currentState, to: "IMPLEMENTING" },
+        };
+      }
+      if (currentState === "AWAITING_MERGE") {
+        ctx.operator_approval = {
+          approved: true,
+          approved_by: "Operator",
+          approved_at: new Date().toISOString(),
+          method: "slash-command",
+        };
+        ctx.previous_state = currentState;
+        ctx.state = "DONE";
+        ctx.transitioned_at = ctx.operator_approval.approved_at;
+        ctx.transitioned_by = "Operator";
+        writeState(ctx);
+        return {
+          content: [{ type: "text", text: `Approved: ${currentState} → DONE\nApproved by: Operator\nAt: ${ctx.transitioned_at}` }],
+          details: { success: true, from: currentState, to: "DONE" },
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Cannot approve from ${currentState}. Approval is only valid from AWAITING_OPERATOR_APPROVAL or AWAITING_MERGE.` }],
+        details: { success: false, from: currentState, to: null, error: `Approve action invalid from ${currentState}` },
+      };
+    }
+
+    // /workflow reset: reset from BLOCKED
+    if (params.action === "reset") {
+      if (params.role !== "Operator") {
+        return {
+          content: [{ type: "text", text: "Only the Operator can reset the workflow." }],
+          details: { success: false, from: currentState, to: null, error: "Role must be Operator for reset action." },
+        };
+      }
+      if (currentState === "BLOCKED") {
+        const guardResult = guardBlockedToPrevious(ctx);
+        if (!guardResult.allowed) {
+          return {
+            content: [{ type: "text", text: `Reset blocked: ${guardResult.reason}` }],
+            details: { success: false, from: currentState, to: null, error: guardResult.reason },
+          };
+        }
+        const resetTarget = ctx.previous_state ?? "PLANNING";
+        ctx.previous_state = "BLOCKED";
+        ctx.state = resetTarget;
+        ctx.block_reason = null;
+        ctx.transitioned_at = new Date().toISOString();
+        ctx.transitioned_by = "Operator";
+        writeState(ctx);
+        return {
+          content: [{ type: "text", text: `Reset: BLOCKED → ${resetTarget}\nReset by: Operator\nAt: ${ctx.transitioned_at}` }],
+          details: { success: true, from: "BLOCKED", to: resetTarget },
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Cannot reset from ${currentState}. Reset is only valid from BLOCKED.` }],
+        details: { success: false, from: currentState, to: null, error: `Reset action invalid from ${currentState}` },
+      };
+    }
+
+    // Target is required for regular transitions (not approve/reset)
+    if (!params.target) {
+      return {
+        content: [{ type: "text", text: "Target state is required for transitions. Use 'action: approve' or 'action: reset' for operator actions." }],
+        details: { success: false, from: currentState, to: null, error: "Missing target parameter." },
+      };
+    }
+
+
     const target = params.target as TransitionTarget;
 
     // ── BLOCKED: allow reset to previous state ───────────────────
     if (currentState === "BLOCKED") {
+      const guardResult = guardBlockedToPrevious(ctx);
+      if (!guardResult.allowed) {
+        return {
+          content: [{ type: "text", text: `Reset blocked: ${guardResult.reason}` }],
+          details: { success: false, from: currentState, to: null, error: guardResult.reason },
+        };
+      }
       const resetTarget = ctx.previous_state ?? "PLANNING";
       if (target !== resetTarget) {
         return {

@@ -7,7 +7,7 @@
  */
 
 import { setup, assign } from "xstate";
-import type { WorkflowContext, TransitionTarget, Role } from "./types.js";
+import type { WorkflowContext, TransitionTarget, Role, ApprovalRecord, WorkflowState } from "./types.js";
 import {
   guardPlanningToAwaitingApproval,
   guardAwaitingApprovalToImplementing,
@@ -19,6 +19,7 @@ import {
   guardRetroToAwaitingMerge,
   guardAwaitingMergeToDone,
   guardToBlocked,
+  guardBlockedToPrevious,
 } from "./guards.js";
 
 // ── Events ──────────────────────────────────────────────────────────
@@ -29,8 +30,8 @@ export type WorkflowEvent =
   | { type: "RESET" }
   | { type: "SET_BRANCH"; branch: string }
   | { type: "SET_PR"; pr: string }
-  | { type: "SET_OPERATOR_APPROVAL"; value: boolean }
-  | { type: "SET_COUNCIL_SIGN_OFF"; value: boolean };
+  | { type: "SET_OPERATOR_APPROVAL"; value: ApprovalRecord }
+  | { type: "SET_COUNCIL_SIGN_OFF"; value: ApprovalRecord };
 
 // ── Machine Factory ─────────────────────────────────────────────────
 
@@ -61,12 +62,30 @@ export function createWorkflowMachine(initialContext: WorkflowContext) {
         guardAwaitingMergeToDone(context).allowed,
       canTransitionToBlocked: ({ context }) =>
         guardToBlocked(context).allowed,
+      canResetToPrevious: ({ context }) =>
+        guardBlockedToPrevious(context).allowed,
     },
   }).createMachine({
     id: "omp-workflow",
     version: "5",
     context: initialContext,
     initial: initialContext.state,
+
+    // Global events — metadata updates work from any state
+    on: {
+      SET_BRANCH: {
+        actions: assign({ feature_branch: ({ event }) => event.branch }),
+      },
+      SET_PR: {
+        actions: assign({ current_pr: ({ event }) => event.pr }),
+      },
+      SET_OPERATOR_APPROVAL: {
+        actions: assign({ operator_approval: ({ event }) => event.value }),
+      },
+      SET_COUNCIL_SIGN_OFF: {
+        actions: assign({ council_sign_off: ({ event }) => event.value }),
+      },
+    },
 
     states: {
       PLANNING: {
@@ -82,17 +101,13 @@ export function createWorkflowMachine(initialContext: WorkflowContext) {
             }),
           },
           BLOCK: {
+            guard: { type: "canTransitionToBlocked" },
             target: "BLOCKED",
             actions: assign({
               previous_state: "PLANNING",
               state: "BLOCKED",
+              block_reason: ({ event }) => event.reason,
             }),
-          },
-          SET_BRANCH: {
-            actions: assign({ feature_branch: ({ event }) => event.branch }),
-          },
-          SET_PR: {
-            actions: assign({ current_pr: ({ event }) => event.pr }),
           },
         },
       },
@@ -109,17 +124,13 @@ export function createWorkflowMachine(initialContext: WorkflowContext) {
               transitioned_by: ({ event }) => event.role,
             }),
           },
-          SET_OPERATOR_APPROVAL: {
-            actions: assign({ operator_approval: ({ event }) => event.value }),
-          },
-          SET_COUNCIL_SIGN_OFF: {
-            actions: assign({ council_sign_off: ({ event }) => event.value }),
-          },
           BLOCK: {
+            guard: { type: "canTransitionToBlocked" },
             target: "BLOCKED",
             actions: assign({
               previous_state: "AWAITING_OPERATOR_APPROVAL",
               state: "BLOCKED",
+              block_reason: ({ event }) => event.reason,
             }),
           },
         },
@@ -137,14 +148,13 @@ export function createWorkflowMachine(initialContext: WorkflowContext) {
               transitioned_by: ({ event }) => event.role,
             }),
           },
-          SET_BRANCH: {
-            actions: assign({ feature_branch: ({ event }) => event.branch }),
-          },
           BLOCK: {
+            guard: { type: "canTransitionToBlocked" },
             target: "BLOCKED",
             actions: assign({
               previous_state: "IMPLEMENTING",
               state: "BLOCKED",
+              block_reason: ({ event }) => event.reason,
             }),
           },
         },
@@ -174,14 +184,13 @@ export function createWorkflowMachine(initialContext: WorkflowContext) {
               }),
             },
           ],
-          SET_COUNCIL_SIGN_OFF: {
-            actions: assign({ council_sign_off: ({ event }) => event.value }),
-          },
           BLOCK: {
+            guard: { type: "canTransitionToBlocked" },
             target: "BLOCKED",
             actions: assign({
               previous_state: "AWAITING_COUNCIL_REVIEW",
               state: "BLOCKED",
+              block_reason: ({ event }) => event.reason,
             }),
           },
         },
@@ -212,10 +221,12 @@ export function createWorkflowMachine(initialContext: WorkflowContext) {
             },
           ],
           BLOCK: {
+            guard: { type: "canTransitionToBlocked" },
             target: "BLOCKED",
             actions: assign({
               previous_state: "VALIDATING",
               state: "BLOCKED",
+              block_reason: ({ event }) => event.reason,
             }),
           },
         },
@@ -234,10 +245,12 @@ export function createWorkflowMachine(initialContext: WorkflowContext) {
             }),
           },
           BLOCK: {
+            guard: { type: "canTransitionToBlocked" },
             target: "BLOCKED",
             actions: assign({
               previous_state: "RETRO",
               state: "BLOCKED",
+              block_reason: ({ event }) => event.reason,
             }),
           },
         },
@@ -255,14 +268,13 @@ export function createWorkflowMachine(initialContext: WorkflowContext) {
               transitioned_by: ({ event }) => event.role,
             }),
           },
-          SET_OPERATOR_APPROVAL: {
-            actions: assign({ operator_approval: ({ event }) => event.value }),
-          },
           BLOCK: {
+            guard: { type: "canTransitionToBlocked" },
             target: "BLOCKED",
             actions: assign({
               previous_state: "AWAITING_MERGE",
               state: "BLOCKED",
+              block_reason: ({ event }) => event.reason,
             }),
           },
         },
@@ -287,14 +299,17 @@ export function createWorkflowMachine(initialContext: WorkflowContext) {
 
       BLOCKED: {
         on: {
-          // RESET from BLOCKED always goes to PLANNING in the machine.
-          // The workflow_transition tool handles restoring the actual
-          // previous_state when the operator issues a reset.
+          // RESET from BLOCKED: the workflow_transition tool restores
+          // previous_state before persisting. The machine targets PLANNING
+          // as a safe default; the tool overrides this with the actual
+          // previous_state from context. The guard validates it is present.
           RESET: {
+            guard: { type: "canResetToPrevious" },
             target: "PLANNING",
             actions: assign({
               state: "PLANNING",
               previous_state: "BLOCKED",
+              block_reason: null,
               transitioned_at: () => new Date().toISOString(),
             }),
           },
