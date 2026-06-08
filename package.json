@@ -13,5 +13,16 @@
     "@oh-my-pi/pi-coding-agent": "*",
     "@types/bun": "^1.0.0",
     "typescript": "^5.4.0"
+  },
+  "omp": {
+    "tools": [
+      ".omp/tools/workflow-transition",
+      ".omp/tools/workflow-status",
+      ".omp/tools/artifact-seal",
+      ".omp/tools/artifact-verify"
+    ],
+    "hooks": [
+      ".omp/hooks/pre/workflow-gate.ts"
+    ]
   }
 }
