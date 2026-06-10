@@ -34,7 +34,7 @@ and **11 valid transitions**. Call `workflow_transition` — if the guard fails,
 error telling you exactly what's missing. No prose, no ambiguity.
 
 ```
-PLANNING               → AWAITING_OPERATOR_APPROVAL   (Planner seals design doc)
+PLANNING               → AWAITING_OPERATOR_APPROVAL   (Planner seals issue set)
 AWAITING_OPERATOR_APPROVAL → IMPLEMENTING             (operator approves)
 IMPLEMENTING           → AWAITING_COUNCIL_REVIEW      (impl-complete artifact sealed)
 AWAITING_COUNCIL_REVIEW → IMPLEMENTING                (Council returns findings)
@@ -136,8 +136,11 @@ git clone https://github.com/opulate/omp-flow.git
     workflow.md                     /workflow slash command
   agents/                           Role definitions
     planner.md · implementor.md · council.md · validator.md · retro.md
-  skills/workflow-protocol/
-    SKILL.md                        State machine reference
+  skills/
+    workflow-protocol/SKILL.md       State machine reference
+    grill-me/SKILL.md
+    red-green-refactor/SKILL.md
+    improve-codebase-architecture/SKILL.md
   workflow/
     state.json                      Persisted state (gitignored during dev)
 
@@ -150,6 +153,19 @@ src/
     hash.ts                         SHA-256 via Node crypto
     state-persistence.ts            Atomic load/write to state.json
 ```
+
+
+## 07 · New Skills (v2)
+
+Three new skills expand the workflow with structured protocols at key trigger points:
+
+| Skill | Trigger | What it does |
+|---|---|---|
+| `grill-me` | Planner start of cycle | Structured alignment interview producing a PRD |
+| `red-green-refactor` | Implementor start of cycle | TDD protocol with anti-cheating guarantee |
+| `improve-codebase-architecture` | Planner module map step | Module structure analysis for deep module consolidation |
+
+Each skill lives in `.omp/skills/<name>/SKILL.md` and is auto-discovered by the harness.
 
 ## Philosophy
 

@@ -90,7 +90,11 @@ export function loadState(): WorkflowContext {
     block_reason: (p.block_reason as WorkflowContext["block_reason"]) ?? null,
     transitioned_at: (p.transitioned_at as WorkflowContext["transitioned_at"]) ?? null,
     transitioned_by: (p.transitioned_by as WorkflowContext["transitioned_by"]) ?? null,
-  };
+    current_issue: typeof p.current_issue === "number" ? p.current_issue : null,
+    issue_board_url: typeof p.issue_board_url === "string" ? p.issue_board_url : null,
+    prd_summary: typeof p.prd_summary === "string" ? p.prd_summary : null,
+   };
+ 
 
   // Persist migration so the file is always current schema version
   if (migratedV2 || migratedV3) {

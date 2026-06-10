@@ -6,7 +6,7 @@ The omp-flow state machine enforces the 5-role development workflow.
 
 | State | Description |
 |---|---|
-| `PLANNING` | Scope tasks, write design docs, define validation contracts |
+| `PLANNING` | Scope tasks via grill-me alignment, produce module maps, create GitHub issues as canon board, define validation contracts |
 | `AWAITING_OPERATOR_APPROVAL` | Operator reviews and approves the plan |
 | `IMPLEMENTING` | Executing on approved design, on feature branch |
 | `AWAITING_COUNCIL_REVIEW` | Council reviews implementation against design |
@@ -20,7 +20,7 @@ The omp-flow state machine enforces the 5-role development workflow.
 ## Valid Transitions
 
 ```
-PLANNING               → AWAITING_OPERATOR_APPROVAL   (Planner seals design doc)
+PLANNING               → AWAITING_OPERATOR_APPROVAL   (Planner seals issue set)
 AWAITING_OPERATOR_APPROVAL → IMPLEMENTING             (operator approves)
 IMPLEMENTING           → AWAITING_COUNCIL_REVIEW      (impl-complete artifact sealed)
 AWAITING_COUNCIL_REVIEW → IMPLEMENTING                (Council returns findings)
@@ -32,6 +32,10 @@ AWAITING_MERGE         → DONE                         (operator merges)
 any                    → BLOCKED                      (gate check fails)
 BLOCKED                → previous state               (operator resets)
 ```
+
+## Per-Issue Cycle (v2)
+
+The IMPLEMENTING → COUNCIL → VALIDATING → RETRO → MERGE loop runs once per issue. After an issue reaches DONE, the workflow loops back for the next unblocked issue. `current_issue` (GitHub issue number) and `issue_board_url` (link to GitHub issues board) are tracked in state context.
 
 ## Guarantees
 
@@ -54,9 +58,18 @@ BLOCKED                → previous state               (operator resets)
 | `validation-report` | Validator | VALIDATING → RETRO |
 | `retro-doc` | Retro | RETRO → AWAITING_MERGE |
 
+
+## Skills (v2)
+
+|Skill|Invoked By|When|
+|---|---|---|
+|`grill-me`|Planner|Start of planning cycle (before module map)|
+|`red-green-refactor`|Implementor|Start of implementation cycle (before any code)|
+|`improve-codebase-architecture`|Planner|Module map step (before scoping issues)|
+
 ## Tools
 
-- `workflow_status` — read current state (includes findings, approval details, state_history, first-run guidance)
+- `workflow_status` — read current state (includes findings, approval details, state_history, first-run guidance, current_issue, issue_board_url)
 - `workflow_transition(target?, role, action?)` — attempt state transition (guard evaluated via XState machine)
   - `action: "approve"` — operator approval from AWAITING_OPERATOR_APPROVAL or AWAITING_MERGE
   - `action: "reset"` — operator reset from BLOCKED or DONE
@@ -91,9 +104,9 @@ Every transition is recorded in `state_history: StateTransition[]` (schema v3+):
 
 `writeState()` validates that artifacts in the context being written are not fewer than what's on disk. Writing a partial context that drops artifacts throws an error. The `transitionState()` helper encapsulates `loadState()` → modify → `writeState()` as the canonical pattern.
 
-## Cycle Lifecycle (Phase 3)
+## Cycle Lifecycle (v2)
 
-DONE is no longer a terminal state. The operator can `/workflow reset` from DONE to start a new planning cycle. The reset clears artifacts, approvals, and archives open findings to `findings_history`.
+DONE is not terminal — it signals one issue complete. After DONE, the workflow loops back to IMPLEMENTING for the next unblocked issue. When all issues are DONE, the operator can `/workflow reset` to start a new planning cycle. Reset clears artifacts, approvals, and archives open findings to `findings_history`.
 
 ## Approval Records (Phase 2)
 

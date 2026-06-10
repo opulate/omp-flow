@@ -4,14 +4,22 @@
  *
  * The gate enforces state-machine discipline at the tool level:
  * - During IMPLEMENTING: blocks writes/merges targeting `main`
+ * - During IMPLEMENTING: warns then blocks `write` on existing files (surgical edit discipline)
  * - During AWAITING_COUNCIL_REVIEW: blocks code modifications
  * - During VALIDATING: blocks code modifications
  * - During DONE: blocks further modifications
  */
 import type { HookAPI } from "@oh-my-pi/pi-coding-agent";
 import { loadState } from "../../../src/integrity/state-persistence.js";
+import { existsSync } from "node:fs";
 
 // Tool calls that imply code modification (role-implying actions)
+
+// ── Surgical Edit Session Tracking ────────────────────────────
+// Tracks `write` calls on existing files during IMPLEMENTING.
+// First occurrence: warning. Second: hard block. Resets on harness restart.
+let writeOnExistingFileCount = 0;
+
 const MODIFYING_TOOLS = new Set([
   "write",
   "edit",
@@ -38,7 +46,7 @@ export default function (pi: HookAPI) {
       };
     }
 
-    // ── IMPLEMENTING: block main-branch operations ──────────────
+    // ── IMPLEMENTING: block main-branch ops + surgical edit ────
     if (state.state === "IMPLEMENTING") {
       if (event.toolName === "bash") {
         const command = (event.input as { command?: string }).command ?? "";
@@ -47,6 +55,24 @@ export default function (pi: HookAPI) {
           return {
             block: true,
             reason: `Cannot operate on 'main' during IMPLEMENTING. Feature branch is: ${state.feature_branch ?? "unknown"}. Use a feature branch.`,
+          };
+        }
+      }
+
+      // Surgical edit discipline: warn then block `write` on existing files
+      if (event.toolName === "write") {
+        const filePath = (event.input as { path?: string }).path;
+        if (filePath && existsSync(filePath)) {
+          writeOnExistingFileCount++;
+          if (writeOnExistingFileCount === 1) {
+            return {
+              block: false,
+              reason: `Surgical edit recommended. Use 'edit' with hashline anchors for existing files. 'write' replaces the entire file. This is a warning — repeated use will be blocked.`,
+            };
+          }
+          return {
+            block: true,
+            reason: `Surgical edit required. Use 'edit' with hashline anchors for existing files. 'write' replaces the entire file.`,
           };
         }
       }

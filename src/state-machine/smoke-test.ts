@@ -81,6 +81,9 @@ assert(Object.keys(ctx.artifacts).length === 0, "no artifacts");
 assert(ctx.council_sign_off === null, "council_sign_off is null");
 assert(ctx.operator_approval === null, "operator_approval is null");
 assert(ctx.block_reason === null, "block_reason is null");
+assert(ctx.current_issue === null, "current_issue is null (v2)");
+assert(ctx.issue_board_url === null, "issue_board_url is null (v2)");
+assert(ctx.prd_summary === null, "prd_summary is null (v2)");
 assert(Array.isArray(ctx.findings_history), "findings_history is array");
 assert(ctx.findings_history.length === 0, "findings_history is empty");
 
@@ -89,7 +92,7 @@ console.log("\n2. State Persistence");
 // Save current on-disk state for later restoration
 const savedState = loadState();
 // Bypass writeState artifact check for test setup — write clean state directly
-writeFileSync(".omp/workflow/state.json", JSON.stringify({ schema_version: 3, state: "PLANNING", state_history: [], previous_state: null, current_pr: null, feature_branch: null, artifacts: {}, council_sign_off: null, operator_approval: null, findings_open: [], findings_history: [], block_reason: null, transitioned_at: null, transitioned_by: null }, null, 2));
+writeFileSync(".omp/workflow/state.json", JSON.stringify({ schema_version: 3, state: "PLANNING", state_history: [], previous_state: null, current_pr: null, feature_branch: null, artifacts: {}, council_sign_off: null, operator_approval: null, findings_open: [], findings_history: [], block_reason: null, transitioned_at: null, transitioned_by: null, current_issue: null, issue_board_url: null, prd_summary: null }, null, 2));
 const loaded = loadState();
 assert(loaded.state === "PLANNING", "round-trip preserves state");
 assert(loaded.schema_version === 3, "round-trip preserves schema_version (v3)");
@@ -97,8 +100,11 @@ assert(loaded.artifacts !== undefined, "round-trip preserves artifacts");
 assert(loaded.findings_open !== undefined, "round-trip preserves findings");
 assert(loaded.block_reason === null, "round-trip preserves block_reason");
 assert(Array.isArray(loaded.state_history), "round-trip preserves state_history");
-// Restore original state
-writeFileSync(".omp/workflow/state.json", JSON.stringify(savedState, null, 2));
+assert(loaded.current_issue === null, "round-trip preserves current_issue as null");
+assert(loaded.issue_board_url === null, "round-trip preserves issue_board_url as null");
+assert(loaded.prd_summary === null, "round-trip preserves prd_summary as null");
+ // Restore original state
+ writeFileSync(".omp/workflow/state.json", JSON.stringify(savedState, null, 2));
 // ── 3. SHA-256 Hashing ────────────────────────────────────────────
 console.log("\n3. SHA-256 Hashing");
 

@@ -109,7 +109,11 @@ export interface WorkflowContext {
   block_reason: string | null;
   transitioned_at: string | null;
   transitioned_by: Role | null;
-}
+  // v2: per-issue cycle tracking
+  current_issue: number | null;
+  issue_board_url: string | null;
+  prd_summary: string | null;
+ }
 
 // ── Initial Context Factory ─────────────────────────────────────────
 export function createInitialContext(): WorkflowContext {
@@ -128,8 +132,11 @@ export function createInitialContext(): WorkflowContext {
     block_reason: null,
     transitioned_at: null,
     transitioned_by: null,
-  };
-}
+    current_issue: null,
+    issue_board_url: null,
+    prd_summary: null,
+   };
+ }
 
 // ── Guard Result ────────────────────────────────────────────────────
 export interface GuardResult {

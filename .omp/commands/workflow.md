@@ -51,3 +51,5 @@ Display the full state machine reference: all states, valid transitions, and gua
 ## Phase 3
 
 All subcommands are implemented. State history tracks every transition. DONE is resettable. Artifact preservation prevents partial-context writes. The `workflow_transition` tool uses `actor.send()` as the single mutation path — guards live exclusively in the XState machine.
+
+## v2 Verified — approve and reset subcommands are complete and match the workflow_transition implementation.
