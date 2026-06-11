@@ -24,7 +24,7 @@ import {
 } from "./guards.js";
 import { createWorkflowMachine } from "./machine.js";
 import { createActor } from "xstate";
-import { writeFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
+import { writeFileSync, readFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
 
 let passed = 0;
 let failed = 0;
@@ -103,9 +103,36 @@ assert(Array.isArray(loaded.state_history), "round-trip preserves state_history"
 assert(loaded.current_issue === null, "round-trip preserves current_issue as null");
 assert(loaded.issue_board_url === null, "round-trip preserves issue_board_url as null");
 assert(loaded.prd_summary === null, "round-trip preserves prd_summary as null");
- // Restore original state
  writeFileSync(".omp/workflow/state.json", JSON.stringify(savedState, null, 2));
-// ── 3. SHA-256 Hashing ────────────────────────────────────────────
+
+// 2b. writeState allows artifact clearing during DONE→PLANNING reset
+console.log("2b. writeState allows artifact clearing on reset");
+// Simulate DONE state with artifacts on disk
+const doneWithArtifacts = {
+  schema_version: 3, state: "DONE", state_history: [], previous_state: "AWAITING_MERGE",
+  current_pr: null, feature_branch: null,
+  artifacts: { "design-doc": { path: ".omp/workflow/_fake.md", sha256: "aaaa", sealed_at: new Date().toISOString(), sealed_by: "Planner" } },
+  council_sign_off: null, operator_approval: null, findings_open: [], findings_history: [],
+  block_reason: null, transitioned_at: new Date().toISOString(), transitioned_by: "Operator",
+  current_issue: null, issue_board_url: null, prd_summary: null,
+};
+writeFileSync(".omp/workflow/state.json", JSON.stringify(doneWithArtifacts, null, 2));
+// Simulate the reset context: empty artifacts, PLANNING state, previous_state DONE
+const resetCtx = { ...doneWithArtifacts, state: "PLANNING", previous_state: "DONE", artifacts: {} };
+let wroteOk = false;
+try {
+  writeState(resetCtx as any);
+  wroteOk = true;
+} catch (e) {
+  wroteOk = false;
+}
+assert(wroteOk, "writeState allows artifact clearing during DONE→PLANNING reset");
+const verifyReset = JSON.parse(readFileSync(".omp/workflow/state.json", "utf-8"));
+assert(Object.keys(verifyReset.artifacts ?? {}).length === 0, "reset state has empty artifacts");
+// Restore
+writeFileSync(".omp/workflow/state.json", JSON.stringify(savedState, null, 2));
+console.log(" ✓ PASS");
+ // ── 3. SHA-256 Hashing ────────────────────────────────────────────
 console.log("\n3. SHA-256 Hashing");
 
 // 3a. Basic computeHash (backward compat)

@@ -109,8 +109,9 @@ export function loadState(): WorkflowContext {
  * Validates that in-flight artifacts are preserved before writing.
  * Throws if the context would drop artifacts present in the on-disk state. */
 export function writeState(ctx: WorkflowContext): void {
-  // Layer 1: artifact preservation — refuse to write if artifacts would be lost
-  if (existsSync(STATE_PATH)) {
+  // Layer 1: artifact preservation — refuse to write if artifacts would be lost.
+  // Skip for PLANNING state (reset transitions intentionally clear artifacts).
+  if (ctx.state !== "PLANNING" && existsSync(STATE_PATH)) {
     try {
       const onDisk = JSON.parse(readFileSync(STATE_PATH, "utf-8")) as Record<string, unknown>;
       const onDiskArtifacts = (onDisk.artifacts as Record<string, unknown>) ?? {};
