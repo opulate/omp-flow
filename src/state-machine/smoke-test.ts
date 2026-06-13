@@ -9,7 +9,9 @@ import type { CouncilFinding, ApprovalRecord } from "./types.js";
 import { loadState, writeState } from "../integrity/state-persistence.js";
 import { computeHash, computeHashString, computeHashWithContent } from "../integrity/hash.js";
 import {
-  guardPlanningToAwaitingApproval,
+  guardPlanningToAwaitingDesignReview,
+  guardAwaitingDesignReviewToAwaitingApproval,
+  guardAwaitingDesignReviewToPlanning,
   guardAwaitingApprovalToImplementing,
   guardImplementingToAwaitingCouncil,
   guardAwaitingCouncilToValidating,
@@ -72,7 +74,7 @@ if (!existsSync(testDir)) {
 // ── 1. Types & Initial Context ────────────────────────────────────
 console.log("\n1. Types & Initial Context");
 const ctx = createInitialContext();
-assert(ctx.schema_version === 3, "schema_version is 3 (v3 state_history)");
+assert(ctx.schema_version === 4, "schema_version is 4 (v4 design findings)");
 assert(Array.isArray(ctx.state_history), "state_history is array");
 assert(ctx.state_history.length === 0, "state_history is empty initially");
 assert(ctx.state === "PLANNING", "initial state is PLANNING");
@@ -86,6 +88,10 @@ assert(ctx.issue_board_url === null, "issue_board_url is null (v2)");
 assert(ctx.prd_summary === null, "prd_summary is null (v2)");
 assert(Array.isArray(ctx.findings_history), "findings_history is array");
 assert(ctx.findings_history.length === 0, "findings_history is empty");
+assert(Array.isArray(ctx.design_findings_open), "design_findings_open is array");
+assert(ctx.design_findings_open.length === 0, "design_findings_open is empty");
+assert(Array.isArray(ctx.design_findings_history), "design_findings_history is array");
+assert(ctx.design_findings_history.length === 0, "design_findings_history is empty");
 
 // ── 2. State Persistence ──────────────────────────────────────────
 console.log("\n2. State Persistence");
@@ -95,7 +101,7 @@ const savedState = loadState();
 writeFileSync(".omp/workflow/state.json", JSON.stringify({ schema_version: 3, state: "PLANNING", state_history: [], previous_state: null, current_pr: null, feature_branch: null, artifacts: {}, council_sign_off: null, operator_approval: null, findings_open: [], findings_history: [], block_reason: null, transitioned_at: null, transitioned_by: null, current_issue: null, issue_board_url: null, prd_summary: null }, null, 2));
 const loaded = loadState();
 assert(loaded.state === "PLANNING", "round-trip preserves state");
-assert(loaded.schema_version === 3, "round-trip preserves schema_version (v3)");
+assert(loaded.schema_version === 4, "round-trip preserves schema_version (migrated to v4)");
 assert(loaded.artifacts !== undefined, "round-trip preserves artifacts");
 assert(loaded.findings_open !== undefined, "round-trip preserves findings");
 assert(loaded.block_reason === null, "round-trip preserves block_reason");
@@ -103,16 +109,19 @@ assert(Array.isArray(loaded.state_history), "round-trip preserves state_history"
 assert(loaded.current_issue === null, "round-trip preserves current_issue as null");
 assert(loaded.issue_board_url === null, "round-trip preserves issue_board_url as null");
 assert(loaded.prd_summary === null, "round-trip preserves prd_summary as null");
+assert(Array.isArray(loaded.design_findings_open), "round-trip preserves design_findings_open");
+assert(loaded.design_findings_open.length === 0, "round-trip preserves design_findings_open as empty");
+assert(Array.isArray(loaded.design_findings_history), "round-trip preserves design_findings_history");
  writeFileSync(".omp/workflow/state.json", JSON.stringify(savedState, null, 2));
 
 // 2b. writeState allows artifact clearing during DONE→PLANNING reset
 console.log("2b. writeState allows artifact clearing on reset");
 // Simulate DONE state with artifacts on disk
 const doneWithArtifacts = {
-  schema_version: 3, state: "DONE", state_history: [], previous_state: "AWAITING_MERGE",
+  schema_version: 4, state: "DONE", state_history: [], previous_state: "AWAITING_MERGE",
   current_pr: null, feature_branch: null,
   artifacts: { "design-doc": { path: ".omp/workflow/_fake.md", sha256: "aaaa", sealed_at: new Date().toISOString(), sealed_by: "Planner" } },
-  council_sign_off: null, operator_approval: null, findings_open: [], findings_history: [],
+  council_sign_off: null, operator_approval: null, findings_open: [], design_findings_open: [], design_findings_history: [], findings_history: [],
   block_reason: null, transitioned_at: new Date().toISOString(), transitioned_by: "Operator",
   current_issue: null, issue_board_url: null, prd_summary: null,
 };
@@ -173,17 +182,12 @@ unlinkSync(testFile);
 // ── 4. Guards ─────────────────────────────────────────────────────
 console.log("\n4. Guards");
 
-// 4a. Planning → Awaiting Approval — blocked without council sign-off
+// 4a. Planning → Awaiting Design Review — blocked without design doc
 const ctx4a = createInitialContext();
-let result = guardPlanningToAwaitingApproval(ctx4a);
-assert(!result.allowed, "planning→approval: blocked without council sign-off");
+let result = guardPlanningToAwaitingDesignReview(ctx4a);
+assert(!result.allowed, "planning→design-review: blocked without design doc");
 
-// 4b. With council sign-off but no design doc
-ctx4a.council_sign_off = makeApproval(true);
-result = guardPlanningToAwaitingApproval(ctx4a);
-assert(!result.allowed, "planning→approval: blocked without design doc");
-
-// 4c. With sealed design doc and council sign-off — passes
+// 4b. With design doc but no contract — blocked
 const designDocPath = ".omp/workflow/_test-design.md";
 writeFileSync(designDocPath, "# Design Doc\n\nPhase 1 plan.");
 ctx4a.artifacts[ARTIFACT_KEYS.DESIGN_DOC] = {
@@ -192,45 +196,10 @@ ctx4a.artifacts[ARTIFACT_KEYS.DESIGN_DOC] = {
   sealed_at: new Date().toISOString(),
   sealed_by: "Planner",
 };
-result = guardPlanningToAwaitingApproval(ctx4a);
-assert(result.allowed, "planning→approval: passes with design doc + council sign-off");
+result = guardPlanningToAwaitingDesignReview(ctx4a);
+assert(!result.allowed, "planning→design-review: blocked without validation contract");
 
-// 4d. Modified design doc (hash mismatch)
-writeFileSync(designDocPath, "# Design Doc\n\nModified content.");
-result = guardPlanningToAwaitingApproval(ctx4a);
-assert(!result.allowed, "planning→approval: blocked on hash mismatch");
-
-// Restore correct content
-writeFileSync(designDocPath, "# Design Doc\n\nPhase 1 plan.");
-result = guardPlanningToAwaitingApproval(ctx4a);
-assert(result.allowed, "planning→approval: passes after restore");
-unlinkSync(designDocPath);
-
-// 4e. Council sign-off null vs false — distinct messages
-const ctx4eMsg = createInitialContext();
-result = guardPlanningToAwaitingApproval(ctx4eMsg);
-assert(!result.allowed, "planning→approval: council_sign_off null blocked");
-assert(result.reason!.includes("pending"), "planning→approval: message says pending for null");
-
-// 4f. Awaiting Approval → Implementing — blocked without operator approval
-const ctx4f = createInitialContext();
-ctx4f.state = "AWAITING_OPERATOR_APPROVAL";
-result = guardAwaitingApprovalToImplementing(ctx4f);
-assert(!result.allowed, "approval→implementing: blocked without operator approval");
-assert(result.reason!.includes("pending"), "approval→implementing: message says pending for null");
-
-// 4g. Operator approval explicitly denied
-ctx4f.operator_approval = makeApproval(false);
-result = guardAwaitingApprovalToImplementing(ctx4f);
-assert(!result.allowed, "approval→implementing: blocked on denied");
-assert(result.reason!.includes("denied"), "approval→implementing: message says denied for false");
-
-// 4h. With operator approval but no contract
-ctx4f.operator_approval = makeApproval(true);
-result = guardAwaitingApprovalToImplementing(ctx4f);
-assert(!result.allowed, "approval→implementing: blocked without contract");
-
-// 4i. With structured contract — passes (Phase 2)
+// 4c. With design doc + structured contract — passes
 const contractPath = ".omp/workflow/_test-contract.md";
 const contractJson = JSON.stringify({
   version: 1,
@@ -239,14 +208,78 @@ const contractJson = JSON.stringify({
 });
 const contractContent = "```json\n" + contractJson + "\n```\n";
 writeFileSync(contractPath, contractContent);
-ctx4f.artifacts[ARTIFACT_KEYS.VALIDATION_CONTRACT] = {
+ctx4a.artifacts[ARTIFACT_KEYS.VALIDATION_CONTRACT] = {
   path: contractPath,
   hash: computeHashString(contractContent),
   sealed_at: new Date().toISOString(),
   sealed_by: "Planner",
 };
-result = guardAwaitingApprovalToImplementing(ctx4f);
-assert(result.allowed, "approval→implementing: passes with approval + structured contract");
+result = guardPlanningToAwaitingDesignReview(ctx4a);
+assert(result.allowed, "planning→design-review: passes with design doc + contract");
+
+// 4d. Modified design doc (hash mismatch) — blocked
+writeFileSync(designDocPath, "# Design Doc\n\nModified content.");
+result = guardPlanningToAwaitingDesignReview(ctx4a);
+assert(!result.allowed, "planning→design-review: blocked on hash mismatch");
+writeFileSync(designDocPath, "# Design Doc\n\nPhase 1 plan.");
+result = guardPlanningToAwaitingDesignReview(ctx4a);
+assert(result.allowed, "planning→design-review: passes after restore");
+
+// 4e. Design Review → Awaiting Approval — blocked without council sign-off
+const ctx4e = createInitialContext();
+ctx4e.state = "AWAITING_DESIGN_REVIEW";
+ctx4e.artifacts[ARTIFACT_KEYS.DESIGN_DOC] = {
+  path: designDocPath,
+  hash: computeHashString("# Design Doc\n\nPhase 1 plan."),
+  sealed_at: new Date().toISOString(),
+  sealed_by: "Planner",
+};
+result = guardAwaitingDesignReviewToAwaitingApproval(ctx4e);
+assert(!result.allowed, "design-review→approval: blocked without council sign-off");
+assert(result.reason!.includes("pending"), "design-review→approval: message says pending for null");
+
+// 4f. Design Review → Awaiting Approval — council sign-off denied
+ctx4e.council_sign_off = makeApproval(false);
+result = guardAwaitingDesignReviewToAwaitingApproval(ctx4e);
+assert(!result.allowed, "design-review→approval: blocked on denied sign-off");
+assert(result.reason!.includes("denied"), "design-review→approval: message says denied for false");
+
+// 4g. Design Review → Awaiting Approval — with sign-off + design doc — passes
+ctx4e.council_sign_off = makeApproval(true);
+result = guardAwaitingDesignReviewToAwaitingApproval(ctx4e);
+assert(result.allowed, "design-review→approval: passes with sign-off + design doc");
+
+// 4h. Design Review → Awaiting Approval — blocked with open design P0
+ctx4e.design_findings_open = [
+  makeFinding({ id: "df-1", severity: "P0", description: "Design flaw in auth", trigger_conditions: "Happens when user has no email", status: "open" }),
+];
+result = guardAwaitingDesignReviewToAwaitingApproval(ctx4e);
+assert(!result.allowed, "design-review→approval: blocked with open design P0");
+assert(result.reason!.includes("open P0/P1"), "design-review→approval: message mentions open findings");
+
+// 4i. Design Review → Awaiting Approval — passes with addressed design findings
+ctx4e.design_findings_open = [
+  makeFinding({ id: "df-1", severity: "P0", description: "Design flaw in auth", trigger_conditions: "Happens when user has no email", status: "addressed", addressed_at: new Date().toISOString() }),
+];
+result = guardAwaitingDesignReviewToAwaitingApproval(ctx4e);
+assert(result.allowed, "design-review→approval: passes with addressed design findings");
+
+// 4j. Design Review → Planning — always allowed
+result = guardAwaitingDesignReviewToPlanning(createInitialContext());
+assert(result.allowed, "design-review→planning: always allowed");
+
+// Cleanup
+unlinkSync(designDocPath);
+unlinkSync(contractPath);
+
+// ── Operator Approval Tests ────────────────────────────────────
+
+// 4k. Awaiting Approval → Implementing — blocked without operator approval
+const ctx4k = createInitialContext();
+ctx4k.state = "AWAITING_OPERATOR_APPROVAL";
+result = guardAwaitingApprovalToImplementing(ctx4k);
+assert(!result.allowed, "approval→implementing: blocked without operator approval");
+assert(result.reason!.includes("pending"), "approval→implementing: message says pending for null");
 
 // 4j. Implementing → Council — blocked without impl-complete
 const ctx4j = createInitialContext();
@@ -467,10 +500,11 @@ result = guardAwaitingMergeToDone(ctx4y);
 assert(result.allowed, "merge→done: passes with operator approval");
 
 // 4z. Always-allowed guards
+result = guardAwaitingDesignReviewToPlanning(createInitialContext());
+assert(result.allowed, "design-review→planning: always allowed");
 result = guardAwaitingCouncilToImplementing(createInitialContext());
 assert(result.allowed, "council→implementing: always allowed");
 result = guardValidatingToImplementing(createInitialContext());
-assert(result.allowed, "validating→implementing: always allowed");
 result = guardToBlocked(createInitialContext());
 assert(result.allowed, "any→blocked: always allowed");
 
@@ -491,12 +525,21 @@ const actor = createActor(testMachine);
 const snapshot = actor.getSnapshot();
 assert(snapshot.value === "PLANNING", "machine starts in PLANNING");
 
-// Machine with council sign-off + design doc in context
+// Machine with design doc + contract in context (ready for PLANNING → AWAITING_DESIGN_REVIEW)
 const ctx5 = createInitialContext();
-ctx5.council_sign_off = makeApproval(true);
+const designDocMachinePath = ".omp/workflow/_test-design-machine.md";
+writeFileSync(designDocMachinePath, "# Test");
 ctx5.artifacts[ARTIFACT_KEYS.DESIGN_DOC] = {
-  path: ".omp/workflow/_test-design-machine.md",
+  path: designDocMachinePath,
   hash: computeHashString("# Test"),
+  sealed_at: new Date().toISOString(),
+  sealed_by: "Planner",
+};
+const contractMachinePath = ".omp/workflow/_test-contract-machine.md";
+writeFileSync(contractMachinePath, "```json\n" + JSON.stringify({ version: 1, scope: { files: ["src/test.ts"] }, assertions: [{ type: "test", description: "run tests" }] }) + "\n```\n");
+ctx5.artifacts[ARTIFACT_KEYS.VALIDATION_CONTRACT] = {
+  path: contractMachinePath,
+  hash: computeHashString(readFileSync(contractMachinePath, "utf-8")),
   sealed_at: new Date().toISOString(),
   sealed_by: "Planner",
 };
@@ -504,6 +547,8 @@ const machine2 = createWorkflowMachine(ctx5);
 const actor2 = createActor(machine2);
 const snap2 = actor2.getSnapshot();
 assert(snap2.value === "PLANNING", "machine initial state matches context state");
+unlinkSync(designDocMachinePath);
+unlinkSync(contractMachinePath);
 
 // ── 6. BLOCK Event Stores block_reason ────────────────────────────
 console.log("\n6. BLOCK Event Stores block_reason");
@@ -569,31 +614,35 @@ assert(finalCtx.block_reason === null || typeof finalCtx.block_reason === "strin
 // ── 9. ApprovalRecord — distinct messages for null/denied/approved ───
 console.log("\n9. ApprovalRecord");
 
-// 9a. Null means pending — distinct from denied
+// 9a. Null means pending — distinct from denied (design review guard)
 const ctx9a = createInitialContext();
-assert(ctx9a.council_sign_off === null, "council_sign_off is null initially");
-let r9a = guardPlanningToAwaitingApproval(ctx9a);
-assert(!r9a.allowed, "planning→approval: blocked on null council_sign_off");
-assert(r9a.reason!.includes("pending"), "null produces 'pending' message, not 'denied'");
-
-// 9b. Denied approval record
-ctx9a.council_sign_off = makeApproval(false);
-r9a = guardPlanningToAwaitingApproval(ctx9a);
-assert(!r9a.allowed, "planning→approval: blocked on denied council_sign_off");
-assert(r9a.reason!.includes("denied"), "denied approval produces 'denied' message");
-
-// 9c. Approved record passes
-ctx9a.council_sign_off = makeApproval(true);
-const designDoc9 = ".omp/workflow/_test-design-9.md";
-writeFileSync(designDoc9, "# Test");
+ctx9a.state = "AWAITING_DESIGN_REVIEW";
 ctx9a.artifacts[ARTIFACT_KEYS.DESIGN_DOC] = {
-  path: designDoc9,
+  path: ".omp/workflow/_test-design-dummy.md",
   hash: computeHashString("# Test"),
   sealed_at: new Date().toISOString(),
   sealed_by: "Planner",
 };
-r9a = guardPlanningToAwaitingApproval(ctx9a);
-assert(r9a.allowed, "planning→approval: passes with approved record + design doc");
+// Need a real file for hash verification
+const designDoc9 = ".omp/workflow/_test-design-9.md";
+writeFileSync(designDoc9, "# Test");
+ctx9a.artifacts[ARTIFACT_KEYS.DESIGN_DOC]!.path = designDoc9;
+ctx9a.artifacts[ARTIFACT_KEYS.DESIGN_DOC]!.hash = computeHashString("# Test");
+assert(ctx9a.council_sign_off === null, "council_sign_off is null initially");
+let r9a = guardAwaitingDesignReviewToAwaitingApproval(ctx9a);
+assert(!r9a.allowed, "design-review→approval: blocked on null council_sign_off");
+assert(r9a.reason!.includes("pending"), "null produces 'pending' message, not 'denied'");
+
+// 9b. Denied approval record
+ctx9a.council_sign_off = makeApproval(false);
+r9a = guardAwaitingDesignReviewToAwaitingApproval(ctx9a);
+assert(!r9a.allowed, "design-review→approval: blocked on denied council_sign_off");
+assert(r9a.reason!.includes("denied"), "denied approval produces 'denied' message");
+
+// 9c. Approved record passes
+ctx9a.council_sign_off = makeApproval(true);
+r9a = guardAwaitingDesignReviewToAwaitingApproval(ctx9a);
+assert(r9a.allowed, "design-review→approval: passes with approved record + design doc");
 unlinkSync(designDoc9);
 
 // 9d. Operator approval — null, denied, approved messages
@@ -703,6 +752,8 @@ const cleanupFiles = [
   ".omp/workflow/_test-design.md",
   ".omp/workflow/_test-implementation.md",
   ".omp/workflow/_test-design-machine.md",
+  ".omp/workflow/_test-contract-machine.md",
+  ".omp/workflow/_test-design-dummy.md",
   ".omp/workflow/_test-file.txt",
   ".omp/workflow/_test-contract.md",
   ".omp/workflow/_test-impl.md",

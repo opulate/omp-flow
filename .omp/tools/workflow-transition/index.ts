@@ -46,8 +46,8 @@ const factory: CustomToolFactory = (pi) => ({
   description:
     "Attempt a workflow state transition. Validates guard conditions before allowing the transition.",
   parameters: pi.zod.object({
-    target: pi.zod
       .enum([
+        "AWAITING_DESIGN_REVIEW",
         "AWAITING_OPERATOR_APPROVAL",
         "IMPLEMENTING",
         "AWAITING_COUNCIL_REVIEW",
@@ -178,9 +178,9 @@ const factory: CustomToolFactory = (pi) => ({
         };
       }
 
-      if (currentState !== "PLANNING") {
+      if (currentState !== "AWAITING_DESIGN_REVIEW") {
         return {
-          content: [{ type: "text", text: `Council sign-off is only valid in PLANNING state. Current state: ${currentState}.` }],
+          content: [{ type: "text", text: `Council sign-off is only valid in AWAITING_DESIGN_REVIEW state. Current state: ${currentState}.` }],
           details: { success: false, from: currentState, to: null, error: `council_signoff invalid from ${currentState}` },
         };
       }

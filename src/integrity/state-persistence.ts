@@ -61,6 +61,7 @@ export function loadState(): WorkflowContext {
 
   const migratedV2 = version < 2;
   const migratedV3 = version < 3;
+  const migratedV4 = version < 4;
 
   // v2→v3: initialize state_history from previous_state if present
   let stateHistory: StateTransition[] = [];
@@ -74,9 +75,8 @@ export function loadState(): WorkflowContext {
   } else if (Array.isArray(p.state_history)) {
     stateHistory = p.state_history as StateTransition[];
   }
-
   const result: WorkflowContext = {
-    schema_version: migratedV2 || migratedV3 ? 3 : version,
+    schema_version: migratedV2 || migratedV3 || migratedV4 ? 4 : version,
     state: (p.state as WorkflowContext["state"]) ?? "PLANNING",
     state_history: stateHistory,
     previous_state: (p.previous_state as WorkflowContext["previous_state"]) ?? null,
@@ -86,6 +86,8 @@ export function loadState(): WorkflowContext {
     council_sign_off,
     operator_approval,
     findings_open: (p.findings_open as WorkflowContext["findings_open"]) ?? [],
+    design_findings_open: (p.design_findings_open as WorkflowContext["design_findings_open"]) ?? [],
+    design_findings_history: (p.design_findings_history as WorkflowContext["design_findings_history"]) ?? [],
     findings_history: (p.findings_history as WorkflowContext["findings_history"]) ?? [],
     block_reason: (p.block_reason as WorkflowContext["block_reason"]) ?? null,
     transitioned_at: (p.transitioned_at as WorkflowContext["transitioned_at"]) ?? null,
@@ -97,7 +99,7 @@ export function loadState(): WorkflowContext {
  
 
   // Persist migration so the file is always current schema version
-  if (migratedV2 || migratedV3) {
+  if (migratedV2 || migratedV3 || migratedV4) {
     writeState(result);
   }
 
@@ -219,6 +221,16 @@ function isValidWorkflowContext(raw: unknown): boolean {
 
   // state_history must be an array if present (v3+)
   if (r.state_history !== undefined && !Array.isArray(r.state_history)) {
+    return false;
+  }
+
+  // design_findings_open must be an array if present (v4+)
+  if (r.design_findings_open !== undefined && !Array.isArray(r.design_findings_open)) {
+    return false;
+  }
+
+  // design_findings_history must be an array if present (v4+)
+  if (r.design_findings_history !== undefined && !Array.isArray(r.design_findings_history)) {
     return false;
   }
 

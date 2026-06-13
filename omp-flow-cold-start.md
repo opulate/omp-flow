@@ -23,9 +23,7 @@
 
 ---
 
-## Decisions Already Made — Do Not Relitigate
-
-- 5-role model is correct and stays: Planner → Operator Gate → Implementor ↔ Council → Validator → Retro
+- 5-role model is correct and stays: Planner ↔ Council (bidirectional design review) → Operator Gate → Implementor ↔ Council → Validator → Retro
 - Git worktree discipline stays
 - Council is mandatory, not opt-in
 - Validation contracts stay — the problem is contract quality and gate enforcement, not the concept
@@ -38,7 +36,11 @@
 ## Workflow States
 
 ```
+## Workflow States
+
+```
 PLANNING
+AWAITING_DESIGN_REVIEW
 AWAITING_OPERATOR_APPROVAL
 IMPLEMENTING
 AWAITING_COUNCIL_REVIEW
@@ -53,49 +55,37 @@ BLOCKED          — explicit error state for failed gate checks
 Valid transitions:
 
 ```
-PLANNING               → AWAITING_OPERATOR_APPROVAL   (Planner seals design doc)
-AWAITING_OPERATOR_APPROVAL → IMPLEMENTING             (operator approves)
-IMPLEMENTING           → AWAITING_COUNCIL_REVIEW      (impl-complete artifact sealed)
-AWAITING_COUNCIL_REVIEW → IMPLEMENTING                (Council returns findings)
-AWAITING_COUNCIL_REVIEW → VALIDATING                  (Council clears)
-VALIDATING             → RETRO                        (validation report sealed)
-VALIDATING             → IMPLEMENTING                 (Validator finds regressions)
-RETRO                  → AWAITING_MERGE               (retro complete)
-AWAITING_MERGE         → DONE                         (operator merges)
-any                    → BLOCKED                      (gate check fails)
-BLOCKED                → previous state               (operator resets)
+PLANNING               → AWAITING_DESIGN_REVIEW        (Planner seals design doc + contract)
+AWAITING_DESIGN_REVIEW → PLANNING                      (Council returns design findings)
+AWAITING_DESIGN_REVIEW → AWAITING_OPERATOR_APPROVAL    (Council clears design + sign-off)
+AWAITING_OPERATOR_APPROVAL → IMPLEMENTING              (operator approves)
+IMPLEMENTING           → AWAITING_COUNCIL_REVIEW       (impl-complete artifact sealed)
+AWAITING_COUNCIL_REVIEW → IMPLEMENTING                 (Council returns findings)
+AWAITING_COUNCIL_REVIEW → VALIDATING                   (Council clears)
+VALIDATING             → RETRO                         (validation report sealed)
+VALIDATING             → IMPLEMENTING                  (Validator finds regressions)
+RETRO                  → AWAITING_MERGE                (retro complete)
+AWAITING_MERGE         → DONE                          (operator merges)
+any                    → BLOCKED                       (gate check fails)
+BLOCKED                → previous state                (operator resets)
 ```
 
 ---
 
 ## Guard Conditions Per Transition
 
-**PLANNING → AWAITING_OPERATOR_APPROVAL**
+**PLANNING → AWAITING_DESIGN_REVIEW**
 - Design doc exists at declared path
 - SHA-256 hash recorded in state
-- Planner-Council review has run (Council sign-off present in state)
+- Validation contract exists, sealed, and uses structured format
 
-**AWAITING_OPERATOR_APPROVAL → IMPLEMENTING**
-- Operator approval recorded (not agent self-approval)
-- Validation contract exists at declared path
-- Contract is delta-scoped: asserts only on files touched by this PR, not repo-wide
+**AWAITING_DESIGN_REVIEW → PLANNING**
+- Always allowed (Council returns design findings for rework)
 
-**IMPLEMENTING → AWAITING_COUNCIL_REVIEW**
-- impl-complete artifact exists at declared path
-- SHA-256 hash matches state record (artifact not modified since seal)
-- Feature branch exists, is not `main`
-
-**AWAITING_COUNCIL_REVIEW → VALIDATING**
-- Council report exists at declared path
-- No P0 or P1 findings open (P2+ may proceed)
-- Council findings are tagged with realistic conditions (no theoretical-only issues)
-
-**VALIDATING → RETRO**
-- Validation report exists at declared path
-- All contract assertions pass against declared scope
-- No regressions introduced in touched files
-
----
+**AWAITING_DESIGN_REVIEW → AWAITING_OPERATOR_APPROVAL**
+- Council design sign-off present and approved in state
+- Design doc unmodified (hash verified)
+- No open P0/P1 design findings
 
 ## Artifact Integrity Model
 
@@ -115,7 +105,7 @@ On `artifact_verify(path, key)`:
 - Compare against stored hash for `key`
 - Return pass/fail — do not proceed on fail
 
-Contracts are sealed by the Planner at `AWAITING_OPERATOR_APPROVAL`. The Validator recomputes the hash before running assertions. A modified contract fails the gate.
+Contracts are sealed by the Planner before transitioning to `AWAITING_DESIGN_REVIEW`. The Validator recomputes the hash before running assertions. A modified contract fails the gate.
 
 ---
 
@@ -180,11 +170,11 @@ Before building any feature, initialise the workflow so that all subsequent deve
 
 Create `.omp/agents/` role definitions based on the 5-role model:
 
-**Planner** — scopes tasks, writes design docs, runs Planner-Council review before sealing, calls `artifact_seal` on the design doc, calls `workflow_transition(AWAITING_OPERATOR_APPROVAL)`.
+**Planner** — scopes tasks, writes design docs and validation contracts, seals artifacts, calls `workflow_transition(AWAITING_DESIGN_REVIEW)` for Council design review. After Council clears design, records council_signoff and transitions to `AWAITING_OPERATOR_APPROVAL`.
 
 **Implementor** — executes on approved design, calls `artifact_seal` on impl-complete marker, calls `workflow_transition(AWAITING_COUNCIL_REVIEW)`. Works on feature branches only. Never touches `main`.
 
-**Council** — reviews impl-complete against design doc. Raises findings with P0/P1/P2/P3 severity. P0/P1 must include realistic trigger conditions, not theoretical scenarios. Calls `workflow_transition(IMPLEMENTING)` on findings or `workflow_transition(VALIDATING)` on clear.
+**Council** — reviews both design (AWAITING_DESIGN_REVIEW) and implementation (AWAITING_COUNCIL_REVIEW). Raises findings with P0/P1/P2/P3 severity. P0/P1 must include realistic trigger conditions, not theoretical scenarios. For design review: calls `workflow_transition(PLANNING)` to return findings. For implementation review: calls `workflow_transition(IMPLEMENTING)` on findings or `workflow_transition(VALIDATING)` on clear.
 
 **Validator** — verifies `artifact_verify` on contract before running. Asserts only on delta scope (files touched by PR). Calls `workflow_transition(RETRO)` on pass or `workflow_transition(IMPLEMENTING)` on regression.
 
@@ -220,7 +210,7 @@ Run Planner-Council review on the design doc before sealing. Council should spec
 - Is the hook intercept surface complete — are there tool calls that imply role actions but aren't covered?
 - Does the contract delta-scope rule hold in the Validator role definition?
 
-Seal the design doc, call `workflow_transition(AWAITING_OPERATOR_APPROVAL)`, and surface for operator review before implementation begins.
+Seal the design doc and validation contract, call `workflow_transition(AWAITING_DESIGN_REVIEW)` for Council design review. After Council clears, record council_signoff, transition to `AWAITING_OPERATOR_APPROVAL`, and surface for operator review before implementation begins.
 
 ---
 
@@ -229,7 +219,7 @@ Seal the design doc, call `workflow_transition(AWAITING_OPERATOR_APPROVAL)`, and
 | Failure | Root Cause | Fix |
 |---|---|---|
 | Validator asserts repo-wide zero errors | Contract written too broadly | Guard requires delta-scoped contracts; contract authorship enforced by Planner at seal |
-| Planner-Council review skipped | Not a formal state | `PLANNING → AWAITING_OPERATOR_APPROVAL` guard requires Council sign-off in state |
+| Planner-Council design review skipped | Not a formal state | `AWAITING_DESIGN_REVIEW` is now a formal state with bidirectional transitions; guard requires Council sign-off + no open P0/P1 design findings |
 | Council severity inflation | No realistic-conditions requirement | Council role definition requires trigger conditions on all P0/P1 findings |
 | Agents skip steps or misroute | Discipline-only enforcement | Transitions blocked by `workflow-gate.ts` hook without valid state |
 

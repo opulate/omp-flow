@@ -7,7 +7,9 @@
 import { setup, assign } from "xstate";
 import type { WorkflowContext, TransitionTarget, Role, ApprovalRecord, WorkflowState } from "./types.js";
 import {
-  guardPlanningToAwaitingApproval,
+  guardPlanningToAwaitingDesignReview,
+  guardAwaitingDesignReviewToAwaitingApproval,
+  guardAwaitingDesignReviewToPlanning,
   guardAwaitingApprovalToImplementing,
   guardImplementingToAwaitingCouncil,
   guardAwaitingCouncilToValidating,
@@ -119,8 +121,12 @@ export function createWorkflowMachine(initialContext: WorkflowContext) {
       events: {} as WorkflowEvent,
     },
     guards: {
-      canTransitionToAwaitingApproval: ({ context }) =>
-        guardPlanningToAwaitingApproval(context).allowed,
+      canTransitionToAwaitingDesignReview: ({ context }) =>
+        guardPlanningToAwaitingDesignReview(context).allowed,
+      canTransitionFromDesignReviewToAwaitingApproval: ({ context }) =>
+        guardAwaitingDesignReviewToAwaitingApproval(context).allowed,
+      canTransitionFromDesignReviewToPlanning: ({ context }) =>
+        guardAwaitingDesignReviewToPlanning(context).allowed,
       canTransitionToImplementing: ({ context }) =>
         guardAwaitingApprovalToImplementing(context).allowed,
       canTransitionToAwaitingCouncil: ({ context }) =>
@@ -158,7 +164,16 @@ export function createWorkflowMachine(initialContext: WorkflowContext) {
     states: {
       PLANNING: {
         on: {
-          TRANSITION: { guard: { type: "canTransitionToAwaitingApproval" }, target: "AWAITING_OPERATOR_APPROVAL", actions: assign(trans("AWAITING_OPERATOR_APPROVAL")) },
+          TRANSITION: { guard: { type: "canTransitionToAwaitingDesignReview" }, target: "AWAITING_DESIGN_REVIEW", actions: assign(trans("AWAITING_DESIGN_REVIEW")) },
+          BLOCK: { guard: { type: "canTransitionToBlocked" }, target: "BLOCKED", actions: assign(blk()) },
+        },
+      },
+      "AWAITING_DESIGN_REVIEW": {
+        on: {
+          TRANSITION: [
+            { guard: { type: "canTransitionFromDesignReviewToAwaitingApproval" }, target: "AWAITING_OPERATOR_APPROVAL", actions: assign(trans("AWAITING_OPERATOR_APPROVAL")) },
+            { guard: { type: "canTransitionFromDesignReviewToPlanning" }, target: "PLANNING", actions: assign(trans("PLANNING")) },
+          ],
           BLOCK: { guard: { type: "canTransitionToBlocked" }, target: "BLOCKED", actions: assign(blk()) },
         },
       },

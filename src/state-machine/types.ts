@@ -5,6 +5,7 @@
 // ── States ──────────────────────────────────────────────────────────
 export type WorkflowState =
   | "PLANNING"
+  | "AWAITING_DESIGN_REVIEW"
   | "AWAITING_OPERATOR_APPROVAL"
   | "IMPLEMENTING"
   | "AWAITING_COUNCIL_REVIEW"
@@ -14,9 +15,9 @@ export type WorkflowState =
   | "DONE"
   | "ERROR"
   | "BLOCKED";
-
 export const WORKFLOW_STATES: readonly WorkflowState[] = [
   "PLANNING",
+  "AWAITING_DESIGN_REVIEW",
   "AWAITING_OPERATOR_APPROVAL",
   "IMPLEMENTING",
   "AWAITING_COUNCIL_REVIEW",
@@ -105,6 +106,8 @@ export interface WorkflowContext {
   council_sign_off: ApprovalRecord | null;
   operator_approval: ApprovalRecord | null;
   findings_open: CouncilFinding[];
+  design_findings_open: CouncilFinding[];  // v4: design review findings (Planner↔Council)
+  design_findings_history: CouncilFinding[];  // v4: archived design findings
   findings_history: CouncilFinding[];
   block_reason: string | null;
   transitioned_at: string | null;
@@ -114,11 +117,9 @@ export interface WorkflowContext {
   issue_board_url: string | null;
   prd_summary: string | null;
  }
-
-// ── Initial Context Factory ─────────────────────────────────────────
 export function createInitialContext(): WorkflowContext {
   return {
-    schema_version: 3,
+    schema_version: 4,
     state: "PLANNING",
     state_history: [],
     previous_state: null,
@@ -128,6 +129,8 @@ export function createInitialContext(): WorkflowContext {
     council_sign_off: null,
     operator_approval: null,
     findings_open: [],
+    design_findings_open: [],
+    design_findings_history: [],
     findings_history: [],
     block_reason: null,
     transitioned_at: null,

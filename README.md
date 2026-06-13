@@ -29,22 +29,24 @@ write validation contracts that assert repo-wide zero errors, and misroute trans
 
 ## 01 · State-machine-gated transitions
 
-Every role transition is a guard-evaluated state change. The XState v5 statechart has **10 states**
-and **11 valid transitions**. Call `workflow_transition` — if the guard fails, you get a structured
+Every role transition is a guard-evaluated state change. The XState v5 statechart has **11 states**
+and **13 valid transitions**. Call `workflow_transition` — if the guard fails, you get a structured
 error telling you exactly what's missing. No prose, no ambiguity.
 
 ```
-PLANNING               → AWAITING_OPERATOR_APPROVAL   (Planner seals issue set)
-AWAITING_OPERATOR_APPROVAL → IMPLEMENTING             (operator approves)
-IMPLEMENTING           → AWAITING_COUNCIL_REVIEW      (impl-complete artifact sealed)
-AWAITING_COUNCIL_REVIEW → IMPLEMENTING                (Council returns findings)
-AWAITING_COUNCIL_REVIEW → VALIDATING                  (Council clears)
-VALIDATING             → RETRO                        (validation report sealed)
-VALIDATING             → IMPLEMENTING                 (Validator finds regressions)
-RETRO                  → AWAITING_MERGE               (retro complete)
-AWAITING_MERGE         → DONE                         (operator merges)
-any                    → BLOCKED                      (gate check fails)
-BLOCKED                → previous state               (operator resets)
+PLANNING               → AWAITING_DESIGN_REVIEW        (Planner seals design doc + contract)
+AWAITING_DESIGN_REVIEW → PLANNING                      (Council returns design findings)
+AWAITING_DESIGN_REVIEW → AWAITING_OPERATOR_APPROVAL    (Council clears design + sign-off)
+AWAITING_OPERATOR_APPROVAL → IMPLEMENTING              (operator approves)
+IMPLEMENTING           → AWAITING_COUNCIL_REVIEW       (impl-complete artifact sealed)
+AWAITING_COUNCIL_REVIEW → IMPLEMENTING                 (Council returns findings)
+AWAITING_COUNCIL_REVIEW → VALIDATING                   (Council clears)
+VALIDATING             → RETRO                         (validation report sealed)
+VALIDATING             → IMPLEMENTING                  (Validator finds regressions)
+RETRO                  → AWAITING_MERGE                (retro complete)
+AWAITING_MERGE         → DONE                          (operator merges)
+any                    → BLOCKED                       (gate check fails)
+BLOCKED                → previous state                (operator resets)
 ```
 
 ## 02 · Artifact integrity you can verify
@@ -55,12 +57,13 @@ between seal and verify.
 
 | Key | Sealed by | Verified at |
 |---|---|---|
-| `design-doc` | Planner | PLANNING → APPROVAL, Council review |
-| `validation-contract` | Planner | APPROVAL → IMPLEMENTING, Validator start |
+| `design-doc` | Planner | PLANNING → DESIGN_REVIEW, Council design review, DESIGN_REVIEW → APPROVAL |
+| `validation-contract` | Planner | PLANNING → DESIGN_REVIEW, APPROVAL → IMPLEMENTING, Validator start |
 | `impl-complete` | Implementor | IMPLEMENTING → COUNCIL |
 | `council-report` | Council | COUNCIL → VALIDATING |
 | `validation-report` | Validator | VALIDATING → RETRO |
 | `retro-doc` | Retro | RETRO → AWAITING_MERGE |
+
 
 ## 03 · Pre-hook enforcement at the tool level
 
@@ -71,6 +74,7 @@ state. It's not advisory — it's a hard block with a reason the agent can read 
 |---|---|
 | `DONE` | Everything except `workflow_status` |
 | `IMPLEMENTING` | Git operations targeting `main` |
+| `AWAITING_DESIGN_REVIEW` | Code modifications (`write`, `edit`, `ast_edit`) |
 | `AWAITING_COUNCIL_REVIEW` | Code modifications (`write`, `edit`, `ast_edit`) |
 | `VALIDATING` | Code modifications |
 | `BLOCKED` | Everything except `workflow_status` and `workflow_transition` |
@@ -80,7 +84,7 @@ state. It's not advisory — it's a hard block with a reason the agent can read 
 | Failure | Cause | Fix |
 |---|---|---|
 | Validator asserts repo-wide zero errors | Contract written too broadly | Guard requires delta-scoped contracts; contract authorship enforced by Planner at seal |
-| Planner-Council review skipped | Not a formal state | `PLANNING → APPROVAL` guard requires Council sign-off in state |
+| Planner-Council design review skipped | Not a formal state | `AWAITING_DESIGN_REVIEW` is now a formal state between PLANNING and APPROVAL with bidirectional transitions and design findings |
 | Council severity inflation | No realistic-conditions requirement | All P0/P1 findings must include trigger conditions — "could theoretically happen" is blocked |
 | Agents skip steps or misroute | Discipline-only enforcement | Transitions blocked by pre-hook without valid state |
 

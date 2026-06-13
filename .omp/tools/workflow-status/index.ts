@@ -25,15 +25,25 @@ const factory: CustomToolFactory = (pi) => ({
       };
     }
 
-    const p0p1Count = ctx.findings_open.filter(
+    const implP0P1Count = ctx.findings_open.filter(
+      (f) => f.severity === "P0" || f.severity === "P1"
+    ).length;
+
+    const designP0P1Count = (ctx.design_findings_open ?? []).filter(
       (f) => f.severity === "P0" || f.severity === "P1"
     ).length;
 
     // Build findings summary
     const findingsLines: string[] = [];
     if (ctx.findings_open.length > 0) {
-      findingsLines.push(`Open findings: ${ctx.findings_open.length} (${p0p1Count} P0/P1)`);
+      findingsLines.push(`Implementation findings: ${ctx.findings_open.length} (${implP0P1Count} P0/P1)`);
       for (const f of ctx.findings_open) {
+        findingsLines.push(`  [${f.severity}] ${f.description}`);
+      }
+    }
+    if ((ctx.design_findings_open ?? []).length > 0) {
+      findingsLines.push(`Design findings: ${ctx.design_findings_open!.length} (${designP0P1Count} P0/P1)`);
+      for (const f of ctx.design_findings_open!) {
         findingsLines.push(`  [${f.severity}] ${f.description}`);
       }
     }
@@ -45,9 +55,11 @@ const factory: CustomToolFactory = (pi) => ({
       return `approved by ${a.approved_by} at ${a.approved_at} (${a.method})`;
     };
 
-    // First-run guidance when PLANNING with no artifacts
+    // First-run guidance
     const nextAction = (ctx.state === "PLANNING" && Object.keys(ctx.artifacts).length === 0)
-      ? "Write a design doc and seal it with artifact_seal(key=\"design-doc\"), then run Planner-Council review. See .omp/agents/planner.md."
+      ? "Write a design doc and seal it with artifact_seal(key=\"design-doc\"), then seal the validation contract and transition to AWAITING_DESIGN_REVIEW for Council review. See .omp/agents/planner.md."
+      : (ctx.state === "AWAITING_DESIGN_REVIEW" && ctx.council_sign_off === null)
+      ? "Council design review in progress. Council: review the design doc and raise findings or call council_signoff. See .omp/agents/council.md."
       : null;
 
     // Build state history summary
@@ -86,7 +98,7 @@ const factory: CustomToolFactory = (pi) => ({
         current_pr: ctx.current_pr,
         artifacts: artifactSummary,
         findings_open: ctx.findings_open,
-        block_reason: ctx.block_reason,
+        design_findings_open: ctx.design_findings_open ?? [],
         council_sign_off: ctx.council_sign_off,
         operator_approval: ctx.operator_approval,
         next_action: nextAction,

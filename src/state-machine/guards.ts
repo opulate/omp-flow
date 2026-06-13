@@ -58,25 +58,73 @@ function verifyArtifactIntegrity(ctx: WorkflowContext, key: string): GuardResult
 
 const PROTECTED_BRANCHES = ["main", "master"] as const;
 
-// ── PLANNING → AWAITING_OPERATOR_APPROVAL ──────────────────────────
+// ── PLANNING → AWAITING_DESIGN_REVIEW ────────────────────────────
 
 /**
- * Guard: PLANNING → AWAITING_OPERATOR_APPROVAL
+ * Guard: PLANNING → AWAITING_DESIGN_REVIEW
  *
- * - Council sign-off present in state
  * - Design doc sealed and unmodified
+ * - Validation contract sealed with valid structure
  */
-export function guardPlanningToAwaitingApproval(ctx: WorkflowContext): GuardResult {
+export function guardPlanningToAwaitingDesignReview(ctx: WorkflowContext): GuardResult {
+  const designVerify = verifyArtifactIntegrity(ctx, ARTIFACT_KEYS.DESIGN_DOC);
+  if (designVerify) return designVerify;
+
+  const contractVerify = verifyArtifactIntegrity(ctx, ARTIFACT_KEYS.VALIDATION_CONTRACT);
+  if (contractVerify) return contractVerify;
+
+  // Validate structured contract format
+  const contractPath = ctx.artifacts[ARTIFACT_KEYS.VALIDATION_CONTRACT]!.path;
+  const hashResult = computeHashWithContent(contractPath);
+  if (hashResult.status === "ok") {
+    const contractCheck = validateContractStructure(hashResult.content, contractPath);
+    if (contractCheck) return contractCheck;
+  }
+
+  return { allowed: true };
+}
+
+// ── AWAITING_DESIGN_REVIEW → AWAITING_OPERATOR_APPROVAL ──────────
+
+/**
+ * Guard: AWAITING_DESIGN_REVIEW → AWAITING_OPERATOR_APPROVAL
+ *
+ * - Council sign-off present and approved
+ * - Design doc sealed and unmodified
+ * - No open P0/P1 design findings
+ */
+export function guardAwaitingDesignReviewToAwaitingApproval(ctx: WorkflowContext): GuardResult {
   if (ctx.council_sign_off === null) {
-    return { allowed: false, reason: "Council sign-off is pending. Complete Planner-Council review first." };
+    return { allowed: false, reason: "Council design sign-off is pending. Complete design review first." };
   }
   if (!ctx.council_sign_off.approved) {
-    return { allowed: false, reason: "Council sign-off was denied. Address Council feedback before re-submitting." };
+    return { allowed: false, reason: "Council design sign-off was denied. Address Council feedback before re-submitting." };
   }
 
   const verify = verifyArtifactIntegrity(ctx, ARTIFACT_KEYS.DESIGN_DOC);
   if (verify) return verify;
 
+  const openP0P1 = ctx.design_findings_open.filter(
+    f => (f.severity === "P0" || f.severity === "P1") && f.status === "open"
+  );
+  if (openP0P1.length > 0) {
+    return {
+      allowed: false,
+      reason: `${openP0P1.length} open P0/P1 design finding(s) remain. Address or close all P0/P1 findings before seeking operator approval.`,
+    };
+  }
+
+  return { allowed: true };
+}
+
+// ── AWAITING_DESIGN_REVIEW → PLANNING ────────────────────────────
+
+/**
+ * Guard: AWAITING_DESIGN_REVIEW → PLANNING
+ *
+ * Council returns design findings. Always allowed.
+ */
+export function guardAwaitingDesignReviewToPlanning(_ctx: WorkflowContext): GuardResult {
   return { allowed: true };
 }
 
