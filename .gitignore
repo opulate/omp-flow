@@ -1,6 +1,6 @@
 node_modules/
 dist/
 
-# Workflow state is gitignored during active development.
-# Commit it when a PR is ready for merge.
-.omp/workflow/state.json
+# Workflow artifacts and state are local-only.
+# A fresh install starts from PLANNING with no artifacts.
+.omp/workflow/
